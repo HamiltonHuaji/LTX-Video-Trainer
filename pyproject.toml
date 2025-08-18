@@ -32,6 +32,7 @@ dependencies = [
     "torchvision>=0.21.0",
     "typer>=0.15.1",
     "wandb>=0.19.11",
+    "einops",
 ]
 
 [dependency-groups]

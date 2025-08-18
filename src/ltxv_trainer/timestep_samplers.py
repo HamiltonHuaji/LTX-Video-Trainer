@@ -92,7 +92,7 @@ class ShiftedLogitNormalTimestepSampler:
             ValueError: If the input batch does not have 3 dimensions
         """
         if batch.ndim != 3:
-            raise ValueError(f"Batch should have 3 dimensions, got {batch.ndim}")
+            raise ValueError(f"Batch should have 3 dimensions, got {batch.ndim} {batch.shape}")
 
         batch_size, seq_length, _ = batch.shape
         return self.sample(batch_size, seq_length, device=batch.device)

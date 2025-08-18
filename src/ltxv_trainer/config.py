@@ -86,9 +86,32 @@ class ConditioningConfig(ConfigBaseModel):
         le=1.0,
     )
 
+    latents_poses_dir: str = Field(
+        default="latents_poses",
+        description="Directory name for latents of reference videos when using reference_video mode",
+    )
+
     reference_latents_dir: str = Field(
         default="ref_latents",
         description="Directory name for latents of reference videos when using reference_video mode",
+    )
+
+    # for PosedReferenceVideoTrainingStrategy
+    reference_latents_poses_dir: str = Field(
+        default="ref_latents_poses",
+        description="Directory containing reference video poses for posed conditioning",
+    )
+
+    # for PosedReferenceVideoTrainingStrategy
+    cross_reference_latents_dir: str = Field(
+        default="cross_ref_latents",
+        description="Directory containing cross-view reference video latents for posed conditioning",
+    )
+
+    # for PosedReferenceVideoTrainingStrategy
+    cross_reference_latents_poses_dir: str = Field(
+        default="cross_ref_latents_poses",
+        description="Directory containing cross-view reference video poses for posed conditioning",
     )
 
 

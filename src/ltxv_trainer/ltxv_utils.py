@@ -3,6 +3,7 @@ from diffusers import AutoencoderKLLTXVideo
 from torch import Tensor
 from transformers import T5EncoderModel, T5Tokenizer
 
+from einops import rearrange
 
 def encode_prompt(
     tokenizer: T5Tokenizer,
@@ -50,17 +51,18 @@ def pack_latents(
         Flattened sequence of patches
     """
     b, c, f, h, w = latents.shape
-    latents = latents.reshape(
-        b,
-        -1,
-        f // temporal_patch_size,
-        temporal_patch_size,
-        h // spatial_patch_size,
-        spatial_patch_size,
-        w // spatial_patch_size,
-        spatial_patch_size,
-    )
-    latents = latents.permute(0, 2, 4, 6, 1, 3, 5, 7).flatten(4, 7).flatten(1, 3)
+    # latents = latents.reshape(
+    #     b,
+    #     -1,
+    #     f // temporal_patch_size,
+    #     temporal_patch_size,
+    #     h // spatial_patch_size,
+    #     spatial_patch_size,
+    #     w // spatial_patch_size,
+    #     spatial_patch_size,
+    # )
+    # latents = latents.permute(0, 2, 4, 6, 1, 3, 5, 7).flatten(4, 7).flatten(1, 3)
+    latents = rearrange(latents, 'b c (f pf) (h ph) (w pw) -> b (f h w) (c pf ph pw)', pf=temporal_patch_size, ph=spatial_patch_size, pw=spatial_patch_size)
     return latents
 
 
@@ -77,7 +79,7 @@ def encode_video(
 
     Args:
         vae: VAE model for encoding
-        image_or_video: Input tensor of shape [B,C,F,H,W] or [B,C,1,H,W]
+        image_or_video: Input tensor of shape [B,C,F,H,W] or [B,C,1,H,W] # Wrong docstring ??????
         patch_size: Spatial patch size
         patch_size_t: Temporal patch size
         device: Target device for tensors
@@ -90,11 +92,11 @@ def encode_video(
     device = device or vae.device
 
     if image_or_video.ndim == 4:
-        image_or_video = image_or_video.unsqueeze(2)
+        image_or_video = image_or_video.unsqueeze(2) # B C H W -> B C 1 H W
     assert image_or_video.ndim == 5, f"Expected 5D tensor, got {image_or_video.ndim}D tensor"
 
     image_or_video = image_or_video.to(device=device, dtype=vae.dtype)
-    image_or_video = image_or_video.permute(0, 2, 1, 3, 4).contiguous()  # [B, C, F, H, W] -> [B, F, C, H, W]
+    image_or_video = image_or_video.permute(0, 2, 1, 3, 4).contiguous()  # [B, F, C, H, W] -> [B, C, F, H, W]
 
     # Encode image/video.
     latents = vae.encode(image_or_video).latent_dist.sample(generator=generator)

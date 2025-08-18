@@ -114,7 +114,7 @@ class LtxvTrainer:
         self,
         disable_progress_bars: bool = False,
         step_callback: StepCallback | None = None,
-    ) -> tuple[Path, TrainingStats]:
+    ) -> tuple[Path | None, TrainingStats]:
         """
         Start the training process.
         Returns:
@@ -374,6 +374,8 @@ class LtxvTrainer:
                     }
                 )
                 self._wandb_run.finish()
+        else:
+            comfy_path = None
 
         self._accelerator.end_training()
 
@@ -553,7 +555,11 @@ class LtxvTrainer:
 
         # Enable gradient checkpointing if requested
         if self._config.optimization.enable_gradient_checkpointing:
-            self._transformer.enable_gradient_checkpointing()
+            if isinstance(self._transformer, torch.nn.parallel.DistributedDataParallel):
+                # If using DDP, enable gradient checkpointing on the wrapped model
+                self._transformer.module.enable_gradient_checkpointing()
+            else:
+                self._transformer.enable_gradient_checkpointing()
 
     @staticmethod
     def _find_checkpoint(checkpoint_path: str | Path) -> Path | None:
