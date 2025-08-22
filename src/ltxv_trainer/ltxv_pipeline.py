@@ -24,7 +24,10 @@ from diffusers.callbacks import MultiPipelineCallbacks, PipelineCallback
 from diffusers.image_processor import PipelineImageInput
 from diffusers.loaders import FromSingleFileMixin, LTXVideoLoraLoaderMixin
 from diffusers.models.autoencoders import AutoencoderKLLTXVideo
-from diffusers.models.transformers import LTXVideoTransformer3DModel
+
+# from diffusers.models.transformers import LTXVideoTransformer3DModel
+from ltxv_trainer.custom.transformer_ltx import LTXVideoTransformer3DModel
+
 from diffusers.pipelines.ltx.pipeline_output import LTXPipelineOutput
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
 from diffusers.schedulers import FlowMatchEulerDiscreteScheduler

@@ -137,7 +137,7 @@ class LTXVideoRotaryPosEmbed(nn.Module):
         grid_f = torch.arange(num_frames, dtype=torch.float32, device=hidden_states.device)
         grid = torch.meshgrid(grid_f, grid_h, grid_w, indexing="ij")
         grid = torch.stack(grid, dim=0)
-        grid = grid.unsqueeze(0).repeat(batch_size, 1, 1, 1, 1)
+        grid = grid.unsqueeze(0).repeat(batch_size, 1, 1, 1, 1) # b c f h w
 
         if rope_interpolation_scale is not None:
             grid[:, 0:1] = grid[:, 0:1] * rope_interpolation_scale[0] * self.patch_size_t / self.base_num_frames

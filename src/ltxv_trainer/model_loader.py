@@ -10,8 +10,10 @@ from diffusers import (
     AutoencoderKLLTXVideo,
     BitsAndBytesConfig,
     FlowMatchEulerDiscreteScheduler,
-    LTXVideoTransformer3DModel,
+    # LTXVideoTransformer3DModel,
 )
+from ltxv_trainer.custom.transformer_ltx import LTXVideoTransformer3DModel
+
 from pydantic import BaseModel, ConfigDict
 from transformers import T5EncoderModel, T5Tokenizer
 

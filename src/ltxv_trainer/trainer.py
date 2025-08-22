@@ -389,6 +389,9 @@ class LtxvTrainer:
         # Use strategy to prepare model inputs
         model_inputs = self._training_strategy.prepare_model_inputs(training_batch)
 
+        from gshub.imports import describe
+        print(f"{describe(model_inputs)=}")
+
         # Run transformer forward pass
         model_pred = self._transformer(**model_inputs)[0]
 

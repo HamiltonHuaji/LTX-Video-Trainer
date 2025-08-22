@@ -438,6 +438,7 @@ class ReferenceVideoTrainingStrategy(TrainingStrategy):
         loss = loss.mul(loss_mask).div(loss_mask.mean())
         return loss.mean()
 
+
 class PosedReferenceVideoTrainingStrategy(TrainingStrategy):
     """Posed reference video training strategy for IC-LoRA.
     temporal concat: cross-reference video (content control) + reference video (view control) + noisy latents
