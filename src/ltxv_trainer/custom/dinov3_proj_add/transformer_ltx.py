@@ -511,21 +511,6 @@ class LTXVideoTransformer3DModel(_LTXVideoTransformer3DModel):
         log(f"{describe(hidden_states)=}")
         # Float[torch.Tensor, 'batch_size num_tokens inner_dim']
 
-        temb, embedded_timestep = self.time_embed(
-            timestep.flatten(),
-            batch_size=batch_size,
-            hidden_dtype=hidden_states.dtype,
-        )
-        log(f"{describe(temb)=} {describe(embedded_timestep)=}") # 14400 2048*6 / 14400 2048
-
-        temb = temb.view(batch_size, -1, temb.size(-1)) # batch_size num_tokens 2048*6
-        embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.size(-1)) # batch_size num_tokens 2048
-        log(f"{describe(temb)=} {describe(embedded_timestep)=}")
-
-        encoder_hidden_states = self.caption_projection(encoder_hidden_states)
-        encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.size(-1))
-        log(f"{describe(encoder_hidden_states)=}") # Float[torch.Tensor, 'batch_size max_length=256 inner_dim']
-
         if image_encoder_hidden_states is not None:
             assert image_encoder_token_range is not None
             # batch_size, num_cond_frames, image_in_channels, image_height, image_width = image_encoder_hidden_states.shape
@@ -540,9 +525,22 @@ class LTXVideoTransformer3DModel(_LTXVideoTransformer3DModel):
             log(f"{describe(image_encoder_token_range)=}")
             log(f"{describe(hidden_states)=}") # 'Tensor([2, 7200, 2048],torch.bfloat16,cuda:0)'
             log(f"{describe(hidden_states[:, image_encoder_token_range[0]:image_encoder_token_range[1]])=}") # 'Tensor([2, 2400, 2048],torch.bfloat16,cuda:0)'
-            # hidden_states[:, image_encoder_token_range[0]:image_encoder_token_range[1]] += image_hidden_states
-            encoder_hidden_states = torch.cat([encoder_hidden_states, image_hidden_states], dim=1)
-            encoder_attention_mask = torch.cat([encoder_attention_mask, torch.ones(image_hidden_states.shape[0:2], device=image_hidden_states.device, dtype=torch.bool).unsqueeze(1)], dim=2)
+            hidden_states[:, image_encoder_token_range[0]:image_encoder_token_range[1]] += image_hidden_states
+
+        temb, embedded_timestep = self.time_embed(
+            timestep.flatten(),
+            batch_size=batch_size,
+            hidden_dtype=hidden_states.dtype,
+        )
+        log(f"{describe(temb)=} {describe(embedded_timestep)=}") # 14400 2048*6 / 14400 2048
+
+        temb = temb.view(batch_size, -1, temb.size(-1)) # batch_size num_tokens 2048*6
+        embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.size(-1)) # batch_size num_tokens 2048
+        log(f"{describe(temb)=} {describe(embedded_timestep)=}")
+
+        encoder_hidden_states = self.caption_projection(encoder_hidden_states)
+        encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.size(-1))
+        log(f"{describe(encoder_hidden_states)=}") # Float[torch.Tensor, 'batch_size max_length=256 inner_dim']
 
         for block in self.transformer_blocks:
             if torch.is_grad_enabled() and self.gradient_checkpointing:

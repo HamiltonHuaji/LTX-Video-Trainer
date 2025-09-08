@@ -1,5 +1,5 @@
-from .base import *
-from .base import CustomTrainerConfig as BaseCustomTrainerConfig
+from ..base import *
+from ..base import CustomTrainerConfig as BaseCustomTrainerConfig
 from .transformer_ltx import LTXVideoTransformer3DModel
 from .ltxv_pipeline import LTXTemporalConcatReferenceConditionPipeline
 from diffusers.utils import export_to_video, load_video, load_image
@@ -365,24 +365,17 @@ class CustomTrainer(LtxvTrainer):
 
             def forward(self, x):
                 return self.func(x)
-        inner_dim = 32 * 64
-        caption_channels = 4096
 
         image_in_channels = 1024
         image_proj_channels = 32
         image_patch_size = 2
-        image_out_channels = inner_dim
-
-        # image_in_channels = 1024
-        # image_proj_channels = 64
-        # image_patch_size = 2
-        # image_out_channels = caption_channels
+        inner_dim = 32 * 64
         self._transformer.image_proj = nn.Sequential(
             nn.Conv2d(image_in_channels, image_proj_channels, kernel_size=1), # 1x1 conv
             Lambda(lambda x: rearrange(x, 'b c h w -> b h w c')),
             nn.LayerNorm(image_proj_channels, eps=1e-6, elementwise_affine=False), # LayerNorm
             Lambda(lambda x: rearrange(x, 'b (h ph) (w pw) c -> b (c ph pw) h w', ph=image_patch_size, pw=image_patch_size)),
-            nn.Conv2d(image_proj_channels*image_patch_size*image_patch_size, image_out_channels, kernel_size=1), # 1x1 conv
+            nn.Conv2d(image_proj_channels*image_patch_size*image_patch_size, inner_dim, kernel_size=1), # 1x1 conv
         ).to(self._accelerator.device)
         image_up_conv = cast(nn.Conv2d, self._transformer.image_proj[-1])
         with torch.no_grad():
@@ -396,7 +389,7 @@ class CustomTrainer(LtxvTrainer):
             # Get data sources from the training strategy
             data_sources = self._training_strategy.get_data_sources()
 
-            self._dataset = CustomDL3DV10KDataset(self._config.data.preprocessed_data_root, num_frames=25, num_cond_frames=8, resolution=(512, 704), discrete_condition_indices=True)
+            self._dataset = CustomDL3DV10KDataset(self._config.data.preprocessed_data_root, num_frames=25, num_cond_frames=8, resolution=(320, 480), discrete_condition_indices=True)
             logger.debug(f"Loaded dataset with {len(self._dataset):,} samples from sources: {list(data_sources)}")
 
         dataloader = DataLoader(
@@ -492,44 +485,22 @@ class CustomTrainer(LtxvTrainer):
                 "dinov3": self._dinov3,
             }
 
+            # Load and add first frame image, if provided
+            if use_images:
+                image_path = self._config.validation.images[j]
+                image = open_image_as_srgb(image_path)
+                if image.size != (height, width):
+                    # Resize and center crop the image to match the validation video dimensions
+                    image = F.resize(image, size=min(width, height))
+                    image = F.center_crop(image, output_size=(width, height))
+                pipeline_inputs["image"] = image
+
             # Load and add reference video, if provided
             if self._config.validation.reference_videos is not None:
                 assert self._config.validation.condition_videos is not None
                 ref_video, _ = read_video(self._config.validation.reference_videos[j])[-frames:]
                 cond_video, _ = read_video(self._config.validation.condition_videos[j])[-frames:]
                 pipeline_inputs["reference_video"] = (cond_video, ref_video)
-
-            # Load and add first frame image, if provided
-            if use_images:
-                assert self._config.validation.images is not None
-                image_path = self._config.validation.images[j]
-                if image_path is None:
-                    image = ref_video[0]
-
-                    current_height, current_width = image.shape[1:]
-                    aspect_ratio = current_width / current_height
-                    target_aspect_ratio = width / height
-
-                    if aspect_ratio > target_aspect_ratio:
-                        # Width is relatively larger, resize based on height
-                        resize_height = height
-                        resize_width = int(resize_height * aspect_ratio)
-                    else:
-                        # Height is relatively larger, resize based on width
-                        resize_width = width
-                        resize_height = int(resize_width / aspect_ratio)
-
-                    image = torchvision.transforms.functional.resize(image, [resize_height, resize_width], antialias=True)
-                    image = torchvision.transforms.functional.center_crop(image, [height, width])
-                    pipeline_inputs["image"] = image
-                else:
-                    if Path(image_path).is_file():
-                        image = open_image_as_srgb(image_path)
-                        if image.size != (height, width):
-                            # Resize and center crop the image to match the validation video dimensions
-                            image = F.resize(image, size=min(width, height))
-                            image = F.center_crop(image, output_size=(width, height))
-                        pipeline_inputs["image"] = image
 
             with torch.amp.autocast(self._accelerator.device.type, dtype=torch.bfloat16):
                 result = pipeline(**pipeline_inputs)

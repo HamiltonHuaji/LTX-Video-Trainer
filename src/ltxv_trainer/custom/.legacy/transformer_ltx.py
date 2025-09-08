@@ -1,7 +1,3 @@
-"""
-This module is unchanged comparing to diffusers.LTXVideoTransformer3DModel
-"""
-
 # Copyright 2025 The Genmo team and The HuggingFace Team.
 # All rights reserved.
 #
@@ -18,8 +14,7 @@ This module is unchanged comparing to diffusers.LTXVideoTransformer3DModel
 # limitations under the License.
 
 import math
-from typing import *
-from jaxtyping import Float, Shaped, Int, Integer, Bool
+from typing import Any, Dict, Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -42,15 +37,6 @@ from diffusers import LTXVideoTransformer3DModel as _LTXVideoTransformer3DModel
 
 logger = logging.get_logger(__name__)  # pylint: disable=invalid-name
 
-from einops import *
-
-class Lambda(nn.Module):
-    def __init__(self, func):
-        super().__init__()
-        self.func = func
-
-    def forward(self, x):
-        return self.func(x)
 
 class LTXVideoAttentionProcessor2_0:
     r"""
@@ -136,7 +122,7 @@ class LTXVideoRotaryPosEmbed(nn.Module):
         num_frames: int,
         height: int,
         width: int,
-        rope_interpolation_scale: Optional[Tuple[torch.Tensor, float, float]],
+        rope_interpolation_scale: Tuple[torch.Tensor, float, float],
         device: torch.device,
     ) -> torch.Tensor:
         # Always compute rope in fp32
@@ -168,10 +154,14 @@ class LTXVideoRotaryPosEmbed(nn.Module):
         batch_size = hidden_states.size(0)
 
         if video_coords is None:
-            assert num_frames is not None, "`num_frames` has to be provided when `video_coords` is None"
-            assert height is not None, "`height` has to be provided when `video_coords` is None"
-            assert width is not None, "`width` has to be provided when `video_coords` is None"
-            grid = self._prepare_video_coords(batch_size, num_frames, height, width, rope_interpolation_scale=rope_interpolation_scale, device=hidden_states.device)
+            grid = self._prepare_video_coords(
+                batch_size,
+                num_frames,
+                height,
+                width,
+                rope_interpolation_scale=rope_interpolation_scale,
+                device=hidden_states.device,
+            )
         else:
             grid = torch.stack(
                 [
@@ -310,26 +300,6 @@ class LTXVideoTransformerBlock(nn.Module):
         return hidden_states
 
 
-# describe(hidden_states)='Tensor([2, 7200, 128],torch.bfloat16,cuda:0)'
-# describe(encoder_hidden_states)='Tensor([2, 256, 4096],torch.bfloat16,cuda:0)'
-# describe(encoder_attention_mask)='Tensor([2, 256],torch.bool,cuda:0)'
-# describe(timestep)='Tensor([2, 7200],torch.float32,cuda:0)'
-# timestep=tensor([[  0.0000,   0.0000,   0.0000,  ..., 972.4800, 972.4800, 972.4800],
-#         [  0.0000,   0.0000,   0.0000,  ..., 972.4800, 972.4800, 972.4800]],
-#        device='cuda:0')
-# num_frames=None height=None width=None
-# rope_interpolation_scale=None
-# describe(video_coords)='Tensor([2, 3, 7200],torch.float32,cuda:0)'
-# describe(attention_kwargs)=None
-# describe(image_rotary_emb)=('Tensor([2, 7200, 2048],torch.float32,cuda:0)', 'Tensor([2, 7200, 2048],torch.float32,cuda:0)')
-# describe(encoder_attention_mask)='Tensor([2, 1, 256],torch.bfloat16,cuda:0)'
-# describe(hidden_states)='Tensor([2, 7200, 2048],torch.bfloat16,cuda:0)'
-# describe(temb)='Tensor([14400, 12288],torch.bfloat16,cuda:0)' describe(embedded_timestep)='Tensor([14400, 2048],torch.bfloat16,cuda:0)'
-# describe(temb)='Tensor([2, 7200, 12288],torch.bfloat16,cuda:0)' describe(embedded_timestep)='Tensor([2, 7200, 2048],torch.bfloat16,cuda:0)'
-# describe(encoder_hidden_states)='Tensor([2, 256, 2048],torch.bfloat16,cuda:0)'
-# describe(shift)='Tensor([2, 7200, 2048],torch.bfloat16,cuda:0)' describe(scale)='Tensor([2, 7200, 2048],torch.bfloat16,cuda:0)' describe(self.scale_shift_table)='Parameter([2, 2048],torch.bfloat16,cuda:0)'
-# describe(output)='Tensor([2, 7200, 128],torch.bfloat16,cuda:0)'
-
 @maybe_allow_in_graph
 class LTXVideoTransformer3DModel(_LTXVideoTransformer3DModel):
     r"""
@@ -380,110 +350,82 @@ class LTXVideoTransformer3DModel(_LTXVideoTransformer3DModel):
         caption_channels: int = 4096,
         attention_bias: bool = True,
         attention_out_bias: bool = True,
-
-        # my modifications:
-        image_in_channels: int = 1024, # DINOv3 output channels
-        image_proj_channels: int = 32, # Project DINOv3 output down to this channels
-        image_patch_size: int = 2, # Patchify DINOv3 output tokens by 2*2
     ) -> None:
-        super(_LTXVideoTransformer3DModel, self).__init__()
-
-        out_channels = out_channels or in_channels
-        inner_dim = num_attention_heads * attention_head_dim
-
-        self.proj_in = nn.Linear(in_channels, inner_dim)
-
-        self.scale_shift_table = nn.Parameter(torch.randn(2, inner_dim) / inner_dim**0.5)
-        self.time_embed = AdaLayerNormSingle(inner_dim, use_additional_conditions=False)
-
-        self.caption_projection = PixArtAlphaTextProjection(in_features=caption_channels, hidden_size=inner_dim)
-
-        self.rope = LTXVideoRotaryPosEmbed(
-            dim=inner_dim,
-            base_num_frames=20,
-            base_height=2048,
-            base_width=2048,
+        super().__init__(
+            in_channels=in_channels,
+            out_channels=out_channels,
             patch_size=patch_size,
             patch_size_t=patch_size_t,
-            theta=10000.0,
+            num_attention_heads=num_attention_heads,
+            attention_head_dim=attention_head_dim,
+            cross_attention_dim=cross_attention_dim,
+            num_layers=num_layers,
+            activation_fn=activation_fn,
+            qk_norm=qk_norm,
+            norm_elementwise_affine=norm_elementwise_affine,
+            norm_eps=norm_eps,
+            caption_channels=caption_channels,
+            attention_bias=attention_bias,
+            attention_out_bias=attention_out_bias,
         )
 
-        self.transformer_blocks = nn.ModuleList(
-            [
-                LTXVideoTransformerBlock(
-                    dim=inner_dim,
-                    num_attention_heads=num_attention_heads,
-                    attention_head_dim=attention_head_dim,
-                    cross_attention_dim=cross_attention_dim,
-                    qk_norm=qk_norm,
-                    activation_fn=activation_fn,
-                    attention_bias=attention_bias,
-                    attention_out_bias=attention_out_bias,
-                    eps=norm_eps,
-                    elementwise_affine=norm_elementwise_affine,
-                )
-                for _ in range(num_layers)
-            ]
-        )
+        # out_channels = out_channels or in_channels
+        # inner_dim = num_attention_heads * attention_head_dim
 
-        self.norm_out = nn.LayerNorm(inner_dim, eps=1e-6, elementwise_affine=False)
-        self.proj_out = nn.Linear(inner_dim, out_channels)
+        # self.proj_in = nn.Linear(in_channels, inner_dim)
 
-        self.gradient_checkpointing = False
+        # self.scale_shift_table = nn.Parameter(torch.randn(2, inner_dim) / inner_dim**0.5)
+        # self.time_embed = AdaLayerNormSingle(inner_dim, use_additional_conditions=False)
 
-        # my modifications:
-        # self.image_proj = nn.Sequential(
-        #     nn.Conv2d(image_in_channels, image_proj_channels, kernel_size=1), # 1x1 conv
-        #     nn.LayerNorm(image_proj_channels, eps=1e-6, elementwise_affine=False), # LayerNorm
-        #     Lambda(lambda x: rearrange(x, 'b c (h ph) (w pw) -> b (c ph pw) h w', ph=image_patch_size, pw=image_patch_size)),
-        #     nn.Conv2d(image_proj_channels*image_patch_size*image_patch_size, inner_dim, kernel_size=1), # 1x1 conv
+        # self.caption_projection = PixArtAlphaTextProjection(in_features=caption_channels, hidden_size=inner_dim)
+
+        # self.rope = LTXVideoRotaryPosEmbed(
+        #     dim=inner_dim,
+        #     base_num_frames=20,
+        #     base_height=2048,
+        #     base_width=2048,
+        #     patch_size=patch_size,
+        #     patch_size_t=patch_size_t,
+        #     theta=10000.0,
         # )
-        # image_up_conv = cast(nn.Conv2d, self.image_proj[-1])
-        # with torch.no_grad():
-        #     image_up_conv.weight.zero_()
-        #     if image_up_conv.bias is not None:
-        #         image_up_conv.bias.zero_()
+
+        # self.transformer_blocks = nn.ModuleList(
+        #     [
+        #         LTXVideoTransformerBlock(
+        #             dim=inner_dim,
+        #             num_attention_heads=num_attention_heads,
+        #             attention_head_dim=attention_head_dim,
+        #             cross_attention_dim=cross_attention_dim,
+        #             qk_norm=qk_norm,
+        #             activation_fn=activation_fn,
+        #             attention_bias=attention_bias,
+        #             attention_out_bias=attention_out_bias,
+        #             eps=norm_eps,
+        #             elementwise_affine=norm_elementwise_affine,
+        #         )
+        #         for _ in range(num_layers)
+        #     ]
+        # )
+
+        # self.norm_out = nn.LayerNorm(inner_dim, eps=1e-6, elementwise_affine=False)
+        # self.proj_out = nn.Linear(inner_dim, out_channels)
+
+        # self.gradient_checkpointing = False
 
     def forward(
         self,
-        hidden_states: Float[torch.Tensor, 'batch_size num_tokens in_channels'], # latents
-        encoder_hidden_states: Float[torch.Tensor, 'batch_size max_length=256 caption_channels'], # text encoder outputs
-        timestep: Shaped[torch.Tensor, 'batch_size num_tokens'], # 0~1000, long or float, different per token as some token are condition or reference
-        encoder_attention_mask: Bool[torch.Tensor, 'batch_size max_length=256'],
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        timestep: torch.LongTensor,
+        encoder_attention_mask: torch.Tensor,
         num_frames: Optional[int] = None,
         height: Optional[int] = None,
         width: Optional[int] = None,
         rope_interpolation_scale: Optional[Union[Tuple[float, float, float], torch.Tensor]] = None,
-        video_coords: Optional[Float[torch.Tensor, 'batch_size 3 num_tokens']] = None,
+        video_coords: Optional[torch.Tensor] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
-        do_describe: bool = False,
-
-        # my modifications:
-        image_encoder_hidden_states: Optional[Float[torch.Tensor, 'batch_size num_cond_frames image_in_channels image_height image_width']] = None,
-        image_encoder_token_range: Optional[Tuple[int, int]] = None,
-        # image_viewmats: Optional[Float[torch.Tensor, 'batch_size num_cond_frames 4 4']] = None,
-        # image_Ks: Optional[Float[torch.Tensor, 'batch_size num_cond_frames 3 3']] = None,
-        # image_width: Optional[int] = None,
-        # image_height: Optional[int] = None,
-        # hidden_states_viewmats: Optional[Float[torch.Tensor, 'batch_size num_frames 4 4']] = None,
-        # hidden_states_Ks: Optional[Float[torch.Tensor, 'batch_size num_frames 3 3']] = None,
-    ) -> torch.Tensor | Transformer2DModelOutput:
-        from gshub.utils import describe
-        if do_describe:
-            log = print
-        else:
-            log = lambda x: None
-        log(f"{describe(hidden_states)=}")
-        log(f"{describe(encoder_hidden_states)=}")
-        log(f"{describe(encoder_attention_mask)=}")
-        log(f"{describe(timestep)=}")
-        log(f"{timestep=}")
-        log(f"{num_frames=} {height=} {width=}")
-        log(f"{rope_interpolation_scale=}")
-        log(f"{describe(video_coords)=}")
-        log(f"{describe(attention_kwargs)=}")
-
+    ) -> torch.Tensor:
         if attention_kwargs is not None:
             attention_kwargs = attention_kwargs.copy()
             lora_scale = attention_kwargs.pop("scale", 1.0)
@@ -495,58 +437,34 @@ class LTXVideoTransformer3DModel(_LTXVideoTransformer3DModel):
             scale_lora_layers(self, lora_scale)
         else:
             if attention_kwargs is not None and attention_kwargs.get("scale", None) is not None:
-                logger.warning("Passing `scale` via `attention_kwargs` when not using the PEFT backend is ineffective.")
+                logger.warning(
+                    "Passing `scale` via `attention_kwargs` when not using the PEFT backend is ineffective."
+                )
 
-        image_rotary_emb: Tuple[Float[torch.Tensor, 'batch_size num_tokens inner_dim'], Float[torch.Tensor, 'batch_size num_tokens inner_dim']] = self.rope(hidden_states, num_frames, height, width, rope_interpolation_scale, video_coords)
-        log(f"{describe(image_rotary_emb)=}")
+        image_rotary_emb = self.rope(hidden_states, num_frames, height, width, rope_interpolation_scale, video_coords)
 
         # convert encoder_attention_mask to a bias the same way we do for attention_mask
         if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:
             encoder_attention_mask = (1 - encoder_attention_mask.to(hidden_states.dtype)) * -10000.0
             encoder_attention_mask = encoder_attention_mask.unsqueeze(1)
-            log(f"{describe(encoder_attention_mask)=}")
 
         batch_size = hidden_states.size(0)
         hidden_states = self.proj_in(hidden_states)
-        log(f"{describe(hidden_states)=}")
-        # Float[torch.Tensor, 'batch_size num_tokens inner_dim']
 
         temb, embedded_timestep = self.time_embed(
             timestep.flatten(),
             batch_size=batch_size,
             hidden_dtype=hidden_states.dtype,
         )
-        log(f"{describe(temb)=} {describe(embedded_timestep)=}") # 14400 2048*6 / 14400 2048
 
-        temb = temb.view(batch_size, -1, temb.size(-1)) # batch_size num_tokens 2048*6
-        embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.size(-1)) # batch_size num_tokens 2048
-        log(f"{describe(temb)=} {describe(embedded_timestep)=}")
+        temb = temb.view(batch_size, -1, temb.size(-1))
+        embedded_timestep = embedded_timestep.view(batch_size, -1, embedded_timestep.size(-1))
 
         encoder_hidden_states = self.caption_projection(encoder_hidden_states)
         encoder_hidden_states = encoder_hidden_states.view(batch_size, -1, hidden_states.size(-1))
-        log(f"{describe(encoder_hidden_states)=}") # Float[torch.Tensor, 'batch_size max_length=256 inner_dim']
-
-        if image_encoder_hidden_states is not None:
-            assert image_encoder_token_range is not None
-            # batch_size, num_cond_frames, image_in_channels, image_height, image_width = image_encoder_hidden_states.shape
-            log(f"{describe(hidden_states)=}") # 'Tensor([2, 7200, 2048],torch.bfloat16,cuda:0)'
-            log(f"{describe(image_encoder_hidden_states)=}") # 'Tensor([2, 4, 1024, 40, 60],torch.float32,cuda:0)'
-            log(f"{describe(rearrange(image_encoder_hidden_states, 'b f c h w -> (b f) c h w'))=}") # 'Tensor([8, 1024, 40, 60],torch.float32,cuda:0)'
-            image_hidden_states = self.image_proj(rearrange(image_encoder_hidden_states, 'b f c h w -> (b f) c h w'))
-            log(f"{describe(image_hidden_states)=}") # 'Tensor([8, 2048, 20, 30],torch.bfloat16,cuda:0)'
-            image_hidden_states = rearrange(image_hidden_states, '(b f) c h w -> b (f h w) c', b=image_encoder_hidden_states.size(0))
-            log(f"{describe(image_hidden_states)=}") # 'Tensor([2, 2400, 2048],torch.bfloat16,cuda:0)'
-            log(f"{batch_size=}") # 2
-            log(f"{describe(image_encoder_token_range)=}")
-            log(f"{describe(hidden_states)=}") # 'Tensor([2, 7200, 2048],torch.bfloat16,cuda:0)'
-            log(f"{describe(hidden_states[:, image_encoder_token_range[0]:image_encoder_token_range[1]])=}") # 'Tensor([2, 2400, 2048],torch.bfloat16,cuda:0)'
-            # hidden_states[:, image_encoder_token_range[0]:image_encoder_token_range[1]] += image_hidden_states
-            encoder_hidden_states = torch.cat([encoder_hidden_states, image_hidden_states], dim=1)
-            encoder_attention_mask = torch.cat([encoder_attention_mask, torch.ones(image_hidden_states.shape[0:2], device=image_hidden_states.device, dtype=torch.bool).unsqueeze(1)], dim=2)
 
         for block in self.transformer_blocks:
             if torch.is_grad_enabled() and self.gradient_checkpointing:
-                assert self._gradient_checkpointing_func is not None
                 hidden_states = self._gradient_checkpointing_func(
                     block,
                     hidden_states,
@@ -564,16 +482,12 @@ class LTXVideoTransformer3DModel(_LTXVideoTransformer3DModel):
                     encoder_attention_mask=encoder_attention_mask,
                 )
 
-        # [None, None, 2, inner_dim] + [batch_size num_tokens None inner_dim]
         scale_shift_values = self.scale_shift_table[None, None] + embedded_timestep[:, :, None]
         shift, scale = scale_shift_values[:, :, 0], scale_shift_values[:, :, 1]
-        log(f"{describe(shift)=} {describe(scale)=} {describe(self.scale_shift_table)=}")
-        # # describe(shift)='Tensor([batch_size, num_tokens, inner_dim],torch.bfloat16,cuda:0)' describe(scale)='Tensor([batch_size, num_tokens, inner_dim],torch.bfloat16,cuda:0)' describe(self.scale_shift_table)='Parameter([2, inner_dim],torch.bfloat16,cuda:0)'
 
         hidden_states = self.norm_out(hidden_states)
         hidden_states = hidden_states * (1 + scale) + shift
         output = self.proj_out(hidden_states)
-        log(f"{describe(output)=}")
 
         if USE_PEFT_BACKEND:
             # remove `lora_scale` from each PEFT layer

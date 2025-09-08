@@ -1,5 +1,5 @@
-from .base import *
-from .base import CustomTrainerConfig as BaseCustomTrainerConfig
+from ..base import *
+from ..base import CustomTrainerConfig as BaseCustomTrainerConfig
 from .transformer_ltx import LTXVideoTransformer3DModel
 from .ltxv_pipeline import LTXTemporalConcatReferenceConditionPipeline
 from diffusers.utils import export_to_video, load_video, load_image
