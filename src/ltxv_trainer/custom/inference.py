@@ -245,7 +245,7 @@ class TransformersVlmCaptioner(MediaCaptioningModel):
             max_pixels=64 * 28 * 28,
         )
 
-@torch.inference_mode()
+@torch.no_grad()
 def encode_prompts(tokenizer, text_encoder, prompts: Prompts, max_sequence_length: int = 256, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None) -> TextEmbeds:
     if isinstance(prompts, list):
         tokenizer, text_encoder = not_none(tokenizer), not_none(text_encoder)
@@ -263,7 +263,7 @@ def encode_prompts(tokenizer, text_encoder, prompts: Prompts, max_sequence_lengt
         return {"prompt_embeds": prompt_embeds, "prompt_attention_mask": prompt_attention_mask.to(device)}
     return {"prompt_embeds": prompts["prompt_embeds"].to(device=device, dtype=dtype), "prompt_attention_mask": prompts["prompt_attention_mask"].to(device=device)}
 
-@torch.inference_mode()
+@torch.no_grad()
 def encode_as_video(vae: AutoencoderKLLTXVideo, pixels: Float[torch.Tensor, 'b f c h w']) -> Float[torch.Tensor, 'b c latent_frames latent_height latent_width']:
     latents_mean, latents_std, scaling_factor = vae.latents_mean, vae.latents_std, vae.config['scaling_factor']
     latents_mean, latents_std = latents_mean.view(1, -1, 1, 1, 1), latents_std.view(1, -1, 1, 1, 1)
@@ -271,7 +271,7 @@ def encode_as_video(vae: AutoencoderKLLTXVideo, pixels: Float[torch.Tensor, 'b f
     latents = cast(AutoencoderKLOutput, vae.encode(latents*2-1, return_dict=True)).latent_dist.sample()
     return (latents - latents_mean) / latents_std * scaling_factor
 
-@torch.inference_mode()
+@torch.no_grad()
 def encode_as_images(vae: AutoencoderKLLTXVideo, pixels: Float[torch.Tensor, 'b f c h w']) -> Float[torch.Tensor, 'b c f h w']:
     latents_mean, latents_std, scaling_factor = vae.latents_mean, vae.latents_std, vae.config['scaling_factor']
     latents_mean, latents_std = latents_mean.view(1, -1, 1, 1, 1), latents_std.view(1, -1, 1, 1, 1)
@@ -339,6 +339,8 @@ class LTXVideoAttnProcessorWithSkipLayerMask(LTXVideoAttnProcessor):
                 hidden_states = attn_out * skip_layer_mask + rearrange(value, 'b s h c -> b s (h c)') * (1.0 - skip_layer_mask)
             else:
                 hidden_states = attn_out
+        else:
+            hidden_states = attn_out
 
         hidden_states = attn.to_out[0](hidden_states)
         hidden_states = attn.to_out[1](hidden_states) # Float[torch.Tensor, 'batch_size num_tokens inner_dim']
@@ -508,6 +510,8 @@ class LTXVideoTransformer3DModel(_LTXVideoTransformer3DModel):
             with torch.no_grad():
                 self.latents_add_proj_in.weight.data.zero_()
                 self.latents_add_proj_in.bias.data.zero_()
+        else:
+            self.latents_add_proj_in = None
 
     @overload
     def forward(
@@ -596,10 +600,6 @@ class LTXVideoTransformer3DModel(_LTXVideoTransformer3DModel):
         hidden_states = self.proj_in(hidden_states)
         # Float[torch.Tensor, 'batch_size num_tokens inner_dim']
 
-        if latents_add is not None:
-            assert hasattr(self, 'latents_add_proj_in'), "latents_add_in_channels was not set during initialization"
-            hidden_states = hidden_states + self.latents_add_proj_in(latents_add)
-
         temb, embedded_timestep = self.time_embed(timestep.flatten(), batch_size=batch_size, hidden_dtype=hidden_states.dtype)
         temb = rearrange(temb, '(b n) c -> b n c', b=batch_size)
         embedded_timestep = rearrange(embedded_timestep, '(b n) c -> b n c', b=batch_size)
@@ -609,6 +609,15 @@ class LTXVideoTransformer3DModel(_LTXVideoTransformer3DModel):
         # Float[torch.Tensor, 'batch_size num_tokens inner_dim']
 
         for i, block in enumerate(self.transformer_blocks):
+            # if i == len(self.transformer_blocks) // 2:
+            if i == 0:
+                # if self.latents_add_proj_in is not None:
+                if latents_add is not None:
+                    assert latents_add is not None, "latents_add cannot be None when latents_add_proj_in is set"
+                    assert hasattr(self, 'latents_add_proj_in'), "latents_add_in_channels was not set during initialization"
+                    assert self.latents_add_proj_in is not None, "latents_add_proj_in was not properly initialized"
+                    hidden_states = hidden_states + self.latents_add_proj_in(latents_add)
+
             if torch.is_grad_enabled() and self.gradient_checkpointing:
                 assert self._gradient_checkpointing_func is not None
                 hidden_states = self._gradient_checkpointing_func(
@@ -698,24 +707,48 @@ def patch_indices(patches: PatchifiedLatents, patch_size=(1, 1, 1)) -> PatchIndi
         patches_sample_coords = torch.stack(patches_sample_coords, dim=-1)
         return patches_sample_coords.unsqueeze(0).repeat(b, 1, 1, 1, 1)
 
-def indices_to_pixel_coords(indices: Union[LatentIndices, PatchIndices], temporal_compress: int = 8, spatial_compress: int = 32, frame_offset: int = 0) -> Float[torch.Tensor, 'b f h w c=3']:
+def indices_to_pixel_coords(indices: Union[LatentIndices, PatchIndices], temporal_compress: int = 8, spatial_compress: int = 32, frame_offset: int = 0) -> Integer[torch.Tensor, 'b f h w c=3']:
     with indices.device:
         # 0,1,2,3 -> 0,8,16,24
         indices = indices * torch.tensor([temporal_compress, spatial_compress, spatial_compress])
         # 0,1,2,3 -> 0,8,16,24 -> 0,1,9,17
         indices[..., 0] = (indices[..., 0] + 1 - temporal_compress).clamp(min=0)
+        # 0,1,2,3 -> 0,8,16,24 -> 0+offset,1+offset,9+offset,17+offset
         indices[..., 0] += frame_offset
     return indices
 
+TokenizedVideoCoords = Float[torch.Tensor, 'b c=3 f*h*w']
+def pixel_to_video_coords(pixel_coords: Integer[torch.Tensor, 'b f h w c=3'], frame_rate: float = 25) -> TokenizedVideoCoords:
+    video_coords = rearrange(pixel_coords, 'b f h w c -> b c (f h w)').float()
+    video_coords[:, 0] /= frame_rate
+    return video_coords
+
 # 展平为 token sequence 的 latents
-TokenizedLatents = Float[torch.Tensor, 'b fp*hp*wp c']
-TokenizedLatentMask = Float[torch.Tensor, 'b fp*hp*wp c']
+TokenizedLatents = Float[torch.Tensor, 'batch_size num_tokens in_channels']
+TokenizedLatentMask = Float[torch.Tensor, 'batch_size num_tokens in_channels']
 TokenizedLatentConditioning = Tuple[TokenizedLatents, TokenizedLatentMask]
 
-def patchify(latents: Latents, patch_size=(1, 1, 1)) -> PatchifiedLatents:
+@overload
+def patchify(latents: None, patch_size=(1, 1, 1)) -> None: ...
+
+@overload
+def patchify(latents: Latents, patch_size=(1, 1, 1)) -> PatchifiedLatents: ...
+
+def patchify(latents: Optional[Latents], patch_size=(1, 1, 1)) -> Optional[PatchifiedLatents]:
+    if latents is None:
+        return None
     pf, ph, pw = patch_size
     return rearrange(latents, 'b c (fp pf) (hp ph) (wp pw) -> b fp hp wp (c pf ph pw)', pf=pf, ph=ph, pw=pw)
-def tokenize(patches: PatchifiedLatents) -> TokenizedLatents:
+
+@overload
+def tokenize(patches: None) -> None: ...
+
+@overload
+def tokenize(patches: PatchifiedLatents) -> TokenizedLatents: ...
+
+def tokenize(patches: Optional[PatchifiedLatents]) -> Optional[TokenizedLatents]:
+    if patches is None:
+        return None
     return rearrange(patches, 'b fp hp wp c -> b (fp hp wp) c')
 
 TextEmbedsTensor = Float[torch.Tensor, 'b s=256 c=1024']
@@ -742,7 +775,7 @@ class BaseLTXVPipeline:
             text_encoder=pipeline.text_encoder,
         )
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def encode_prompts(self, prompts: Prompts, max_sequence_length: int = 256, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None) -> TextEmbeds:
         return encode_prompts(self.tokenizer, self.text_encoder, prompts, max_sequence_length=max_sequence_length, device=device, dtype=dtype)
 
@@ -785,7 +818,7 @@ class BaseLTXVPipeline:
         else:
             raise ValueError(f"Unsupported guidance scale source: {source}")
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def latents_sample_loop(
         self,
 
@@ -811,6 +844,8 @@ class BaseLTXVPipeline:
         device: Optional[torch.device] = None,
         dtype: Optional[torch.dtype] = None,
         generator: Optional[torch.Generator] = None,
+
+        **extras
     ):
         device, dtype = (device or self.transformer.device), (dtype or self.transformer.dtype)
 
@@ -876,6 +911,7 @@ class BaseLTXVPipeline:
                 skip_layer_mask=self.transformer.create_skip_layer_mask(batch_size, num_cond, num_cond-1, [19]) if do_spatio_temporal_guidance else None,
                 skip_layer_strategy=SkipLayerStrategy.AttentionValues if do_spatio_temporal_guidance else None,
                 return_dict=True,
+                **extras
             ).sample)
             noise_pred_chunks = noise_pred.chunk(num_cond)
             if do_classifier_free_guidance:
@@ -909,6 +945,7 @@ class BaseLTXVPipeline:
 
             denoised_latents = cast(FlowMatchEulerDiscreteSchedulerOutput, self.scheduler.step(
                 -noise_pred, timestep=t, sample=input_latents, per_token_timesteps=timestep, return_dict=True # type: ignore
+                # noise_pred, timestep=t, sample=input_latents, per_token_timesteps=None, return_dict=True # type: ignore
             )).prev_sample
 
             if conditioning is None:
@@ -921,7 +958,7 @@ class BaseLTXVPipeline:
         # untokenize & unpatchify
         # return rearrange(latents, 'b (fp hp wp) (c pf ph pw) -> b c (fp pf) (hp ph) (wp pw)', fp=latent_f, hp=latent_h, wp=latent_w, pf=1, ph=1, pw=1)
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def sample_latents(
         self,
         prompts: Prompts,
@@ -1129,7 +1166,7 @@ class BaseLTXVPipeline:
         # untokenize & unpatchify
         return rearrange(tokens, 'b (fp hp wp) (c pf ph pw) -> b c (fp pf) (hp ph) (wp pw)', fp=latent_f, hp=latent_h, wp=latent_w, pf=1, ph=1, pw=1)
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def sample_videos(
         self,
         normalized_latents: Latents,

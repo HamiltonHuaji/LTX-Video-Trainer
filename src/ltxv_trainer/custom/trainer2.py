@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from abc import abstractmethod
 import math
 import copy
 import random
@@ -32,9 +33,9 @@ from ltxv_trainer.timestep_samplers import TimestepSampler
 from ltxv_trainer.training_strategies import TrainingStrategy
 from ltxv_trainer.quantization import quantize_model
 from ltxv_trainer.model_loader import LtxvModelVersion, load_vae
-from ltxv_trainer.custom.base import CustomDL3DV10KDatasetBatch, CustomDL3DV10KDataset, load_ltxv_xfmr_2b_manually
+from ltxv_trainer.custom.base import CustomDL3DV10KDatasetBatch, CustomDL3DV10KDataset, load_ltxv_xfmr_2b_manually, ltxv_resize_and_crop
 
-from ltxv_trainer.custom.inference import BaseLTXVPipeline, LTXVideoTransformer3DModel, Latents, LatentConditioning, latent_indices, patch_indices, indices_to_pixel_coords, patchify, tokenize, encode_as_video, encode_as_images, randn_like
+from ltxv_trainer.custom.inference import BaseLTXVPipeline, LTXVideoTransformer3DModel, Latents, LatentConditioning, TokenizedLatents, TokenizedLatentMask, TokenizedVideoCoords, latent_indices, patch_indices, indices_to_pixel_coords, patchify, tokenize, encode_as_video, encode_as_images, randn_like
 
 from diffusers import BitsAndBytesConfig
 from diffusers.models.autoencoders import AutoencoderKLLTXVideo
@@ -75,9 +76,9 @@ class Video(BaseModel):
 class ValidationSample(BaseModel):
     model_config = ConfigDict(extra="allow")
 
-    reference_video: str | Video
-    condition_video: str | Video
-
+    reference_video: Optional[str | Video] = None
+    condition_video: Optional[str | Video] = None
+    target_video: Optional[str | Video] = None
     first_frame: Optional[str | VideoFrame] = None
 
     prompt: Optional[str] = None
@@ -230,7 +231,7 @@ class CustomReferenceVideoTrainingStrategy(TrainingStrategy):
     def get_data_sources(self):
         return {}
 
-    @torch.inference_mode()
+    @torch.no_grad()
     def prepare_batch(self, batch: CustomDL3DV10KDatasetBatch, timestep_sampler: TimestepSampler) -> CustomTrainingBatch:
         t_compress, s_compress = self._vae.temporal_compression_ratio, self._vae.spatial_compression_ratio
 
@@ -838,10 +839,188 @@ class CustomTrainer(LtxvTrainer):
         logger.info(f"🎥 Validation samples for step {self._global_step} saved in {rel_outputs_path}")
         return video_paths
 
+CustomBaseTrainingStrategyContext = TypedDict('CustomBaseTrainingStrategyContext', {
+    # model inputs:
+    'hidden_states': TokenizedLatents,
+    'timestep': Shaped[torch.Tensor, 'batch_size num_tokens'],
+    'video_coords': TokenizedVideoCoords,
+
+    # train / inference auxiliary inputs:
+    'condition_mask': TokenizedLatentMask,
+    'model_pred': Optional[TokenizedLatents],
+})
+
+class CustomBaseTrainingStrategy(TrainingStrategy):
+    def get_data_sources(self):
+        # No need to implement; the trainer will handle dataset directly.
+        return {}
+
+    @property
+    def _override_frame_rate(self) -> Optional[float]:
+        return getattr(self, 'override_frame_rate', None)
+
+    @property
+    def _default_frame_rate(self) -> float:
+        return getattr(self, 'default_frame_rate', 25)
+
+    def compute_loss(self, model_pred: Float[torch.Tensor, 'b n c'], batch: Dict[str, torch.Tensor]) -> torch.Tensor:
+        """Compute masked loss only on target portion, excluding conditioning tokens."""
+        loss = (model_pred - batch['model_pred']).pow(2)
+        # Create loss mask: exclude conditioning tokens
+        loss_mask = (1 - batch['condition_mask']).float()
+        # Apply original loss computation pattern
+        loss = loss.mul(loss_mask).div(loss_mask.mean() + 1e-3)
+        return loss.mean()
+
+    @torch.no_grad()
+    def prepare_model_inputs(self, batch: Dict[str, torch.Tensor]):
+        model_inputs = {
+            k: v for k, v in batch.items()
+            if k in 'hidden_states encoder_hidden_states encoder_attention_mask video_coords timestep latents_add'.split()
+        }
+        return model_inputs
+
+    @torch.no_grad()
+    def prepare_batch(self, batch: Dict[str, torch.Tensor], timestep_sampler: TimestepSampler):
+        prompt_embeds = batch["prompt_embeds"] # b s=256 c=4096
+        prompt_attention_mask = batch["prompt_attention_mask"] # b s=256
+
+        target_pixels: Float[torch.Tensor, 'b t c h w'] = batch['target_pixels']
+        reference_pixels: Optional[Float[torch.Tensor, 'b r c h w']] = batch.get('reference_pixels', None)
+        condition_pixels: Optional[Float[torch.Tensor, 'b n c h w']] = batch.get('condition_pixels', None)
+
+        b, t, c, h, w = target_pixels.shape
+
+        context = self.prepare_context(
+            target_pixels=target_pixels,
+            reference_pixels=reference_pixels,
+            condition_pixels=condition_pixels,
+            video_dims=(w, h, t),
+            generator=None,
+            timestep_sampler=timestep_sampler,
+            frame_rate=self._override_frame_rate or batch.get('fps', self._default_frame_rate)
+        )
+
+        return {
+            'hidden_states': context['hidden_states'],
+            'encoder_hidden_states': prompt_embeds,
+            'encoder_attention_mask': prompt_attention_mask,
+            'timestep': context['timestep'],
+            'video_coords': context['video_coords'],
+            'latents_add': context.get('latents_add', None), # b (t h w) (1024 or 2048)
+
+            'model_pred': context['model_pred'], # b (t h w) c
+            'condition_mask': context['condition_mask'], # b (t h w) c
+            # 'noise': context['noise'], # b (t h w) c
+        }
+
+    @abstractmethod
+    def prepare_context(
+        self,
+        *,
+        target_pixels: Optional[Float[torch.Tensor, 'b t c h w']] = None,
+        reference_pixels: Optional[Float[torch.Tensor, 'b r c h w']] = None,
+        condition_pixels: Optional[Float[torch.Tensor, 'b n c h w']] = None,
+        first_frame_pixels: Optional[Float[torch.Tensor, 'b f c h w']] = None,
+        video_dims: Tuple[int, int, int] = (960, 640, 25), # width, height, frames
+        generator: Optional[torch.Generator] = None,
+        timestep_sampler: Optional[TimestepSampler] = None,
+        frame_rate: float | Float[torch.Tensor, 'b'] = 25,
+        **unused_kwargs,
+    ) -> CustomBaseTrainingStrategyContext:
+        raise NotImplementedError()
+
 
 ##### Pi3 probe
 
-class CustomPi3EncoderProbeVideoTrainingStrategy(TrainingStrategy):
+class LTXVDataset(Dataset):
+    @property
+    def discrete_reference_indices(self):
+        if isinstance(self._discrete_reference_indices, float):
+            return random.random() < self._discrete_reference_indices
+        return self._discrete_reference_indices
+
+    @property
+    def discrete_condition_indices(self):
+        if isinstance(self._discrete_condition_indices, float):
+            return random.random() < self._discrete_condition_indices
+        return self._discrete_condition_indices
+
+    def random_slice(self, length: int, total_length: int):
+        slice_start = random.randint(0, total_length - length)
+        slice_stop = slice_start + self.num_frames
+        return slice(slice_start, slice_stop)
+
+    def random_indices(self, length: int, total_length: int) -> List[int]:
+        return torch.randperm(total_length)[:length].tolist()
+
+    def __init__(
+        self, data_root: str | Path, num_frames: int, num_cond_frames: int, resolution: Tuple[int, int] = (640, 960), *,
+        discrete_reference_indices: bool | float = False, discrete_condition_indices: bool | float = True,
+    ):
+        super().__init__()
+        self.data_root = Path(data_root)
+        assert self.data_root.is_dir(), f"Data root {data_root} is not a directory."
+
+        import json
+        with open(self.data_root / 'dataset.json') as f:
+            self.items = json.load(f)
+
+        self.num_frames = num_frames
+        self.num_cond_frames = num_cond_frames
+        self.resolution = resolution
+
+        self._discrete_reference_indices = discrete_reference_indices
+        self._discrete_condition_indices = discrete_condition_indices
+
+        if (self.data_root / 'default_prompt.pt').exists():
+            self.default_prompt = torch.load(self.data_root / 'default_prompt.pt')
+        else:
+            self.default_prompt = None
+
+    def __len__(self):
+        return len(self.items)
+
+    def __getitem__(self, index: int) -> Any:
+        item = self.items[index % len(self)]
+        prompt = torch.load((self.data_root / '.precomputed/conditions' / item['media_path']).with_suffix('.pt'))
+
+        target_decoder = VideoDecoder(self.data_root / item['media_path'], dimension_order='NCHW')
+        total_frames = target_decoder.metadata.num_frames or 0
+        if total_frames < self.num_frames:
+            print(f"Error: too few frames ({total_frames}) in {item}.")
+            self.items.pop(index)
+            return self[index % len(self)]
+        if self.discrete_reference_indices:
+            ref_selection = self.random_indices(self.num_cond_frames, total_frames)
+            # reference_pixels = ref_pixels_decoder.get_frames_at(indices=ref_selection).data
+            # reference_depths = ref_depths_decoder.get_frames_at(indices=ref_selection).data
+            target_pixels = target_decoder.get_frames_at(indices=ref_selection).data
+        else:
+            ref_selection = self.random_slice(self.num_frames, total_frames)
+            # reference_pixels = ref_pixels_decoder[ref_selection]
+            # reference_depths = ref_depths_decoder[ref_selection]
+            target_pixels = target_decoder[ref_selection]
+        # reference_extrinsics = extrinsics[ref_selection]
+        # reference_intrinsics = intrinsics[ref_selection]
+
+        return {
+            'fps': target_decoder.metadata.average_fps or 25,
+            'prompt_embeds': prompt['prompt_embeds'],
+            'prompt_attention_mask': prompt['prompt_attention_mask'],
+            'target_pixels': F.interpolate(target_pixels.float() / 255, size=self.resolution, mode='bilinear', align_corners=False), # t c h w
+
+            # 'reference_pixels': F.interpolate(reference_pixels.float() / 255, size=self.resolution, mode='bilinear', align_corners=False), # t c h w
+            # 'reference_depths': F.interpolate(reference_depths.float() / 255, size=self.resolution, mode='bilinear', align_corners=False), # t c h w
+            # 'reference_extrinsics': reference_extrinsics, # t 4 4
+            # 'reference_intrinsics': reference_intrinsics, # t 3 3
+
+            # 'condition_pixels': F.interpolate(condition_pixels.float() / 255, size=self.resolution, mode='bilinear', align_corners=False), # r c h w
+            # 'condition_extrinsics': condition_extrinsics, # r 4 4
+            # 'condition_intrinsics': condition_intrinsics, # r 3 3
+        }
+
+class CustomPi3EncoderProbeVideoTrainingStrategy(CustomBaseTrainingStrategy):
     @torch.compile
     def pi3_encoder_feature(self, images: Float[torch.Tensor, 'b n c h w']) -> Float[torch.Tensor, 'b n ph pw d']:
         b, n, c, h, w = images.shape # assert c == 3
@@ -853,16 +1032,19 @@ class CustomPi3EncoderProbeVideoTrainingStrategy(TrainingStrategy):
             hidden = hidden['x_norm_patchtokens']
         return hidden.view(b, n, patch_h, patch_w, -1)
 
+    @torch.compile
     def pi3_decoder_feature(self, encoder_feat: Float[torch.Tensor, 'b n ph pw d']) -> Float[torch.Tensor, 'b n ph pw e']:
         b, n, ph, pw, d = encoder_feat.shape
         h, w = ph * 14, pw * 14
         hidden, pos = self._pi3.decode(rearrange(encoder_feat, 'b n ph pw d -> (b n) (ph pw) d'), n, h, w)
         return hidden[:, self._pi3.patch_start_idx:].view(b, n, ph, pw, -1) # remove register tokens
 
+    @torch.compile
+    @torch.no_grad()
     def pi3_feature(self, images: Float[torch.Tensor, 'b n c h w']) -> Float[torch.Tensor, 'b n ph pw 2*d']:
         encoder_feat = self.pi3_encoder_feature(images)
         decoder_feat = self.pi3_decoder_feature(encoder_feat)
-        return decoder_feat
+        return encoder_feat, decoder_feat
 
     def __init__(self, conditioning_config: ConditioningConfig, vae: AutoencoderKLLTXVideo, pi3: Any):
         super().__init__(conditioning_config)
@@ -872,165 +1054,147 @@ class CustomPi3EncoderProbeVideoTrainingStrategy(TrainingStrategy):
         self._pi3 = cast(Pi3, pi3)
         self._pi3_transform = Pi3Config.transform()
 
-    def get_data_sources(self):
-        return {}
+        self.override_frame_rate = 10
 
-    @torch.inference_mode()
-    def prepare_batch(self, batch: CustomDL3DV10KDatasetBatch, timestep_sampler: TimestepSampler) -> CustomTrainingBatch:
+    def prepare_context(
+        self,
+        target_pixels: Optional[Float[torch.Tensor, 'b t c h w']] = None,
+        first_frame_pixels: Optional[Float[torch.Tensor, 'b f c h w']] = None,
+        reference_pixels: Optional[Float[torch.Tensor, 'b r c h w']] = None,
+        condition_pixels: Optional[Float[torch.Tensor, 'b n c h w']] = None,
+        video_dims: Tuple[int, int, int] = (960, 640, 25), # width, height, frames
+        generator: Optional[torch.Generator] = None,
+        timestep_sampler: Optional[TimestepSampler] = None,
+        frame_rate: float = 25,
+        **unused_kwargs,
+    ):
         t_compress, s_compress = self._vae.temporal_compression_ratio, self._vae.spatial_compression_ratio
 
-        prompt_embeds = batch["prompt_embeds"] # b s=256 c=4096
-        prompt_attention_mask = batch["prompt_attention_mask"] # b s=256
-
-        target_pixels: Float[torch.Tensor, 'b t c h w'] = batch['target_pixels'] # ground truth, 30fps, 25 frames
-        # reference_pixels: Float[torch.Tensor, 'b t c h w'] = batch['reference_pixels'] # reference video for camera control, 30fps; but we will drop 7/8 frames and train the model to interpolate between frames
-        # condition_pixels: Float[torch.Tensor, 'b f c h w'] = batch['condition_pixels'] # condition video or individual images.
-
-        b, t, c, h, w = target_pixels.shape
-        # _, f, _, _, _ = condition_pixels.shape
-
-        # reference_pixels = reference_pixels[:, [i for i in range(0, t, t_compress)]]
-        # _, r, _, _, _ = reference_pixels.shape
+        if target_pixels is not None:
+            b, t, c, h, w = target_pixels.shape
+        else:
+            width, height, frames = video_dims
+            b, t, c, h, w = 1, frames, 3, height, width
 
         latent_frames = (t - 1) // t_compress + 1
         latent_height = h // s_compress
         latent_width = w // s_compress
 
-        # Step 1: get feature
-        # Currently, we only use feature from pi3 decoder outputs
-        pi3_input_images = self._pi3_transform(target_pixels[:, [max(i-t_compress+1, 0) for i in range(0, t+t_compress-1, t_compress)]]) # b t c h w
-        pi3_input_images = F.interpolate(rearrange(pi3_input_images, 'b t_plus_r c h w -> (b t_plus_r) c h w'), size=(latent_height*14, latent_width*14), mode='bicubic', align_corners=False, antialias=True)
-        # feature = self.pi3_feature(rearrange(pi3_input_images.to(self._vae.dtype), '(b t_plus_r) c h w -> b t_plus_r c h w', b=b)) # b 2*d=2*1024 t+f latent_height latent_width
-        # feature = self.pi3_encoder_feature(rearrange(pi3_input_images.to(self._vae.dtype), '(b t_plus_r) c h w -> b t_plus_r c h w', b=b)) # b t latent_height latent_width c
-        feature = self.pi3_feature(rearrange(pi3_input_images.to(self._vae.dtype), '(b t_plus_r) c h w -> b t_plus_r c h w', b=b)) # b t latent_height latent_width c
+        if (target_pixels is not None) and (timestep_sampler is not None):
+            target_latents = encode_as_video(self._vae, target_pixels) # b c latent_frames latent_height latent_width
+            # print(f"{target_latents.std(dim=(1, 3, 4))=}")
+            target_condition_mask = torch.zeros((b, 128, latent_frames, latent_height, latent_width), device=target_latents.device, dtype=target_latents.dtype)
+        else:
+            target_latents = torch.randn((b, 128, latent_frames, latent_height, latent_width), device=self._vae.device, dtype=self._vae.dtype, generator=generator)
+            target_condition_mask = torch.zeros((b, 128, latent_frames, latent_height, latent_width), device=target_latents.device, dtype=target_latents.dtype)
 
-        # Step 2: get vae latents
-        # frames from condition_pixels are treated as individual images.
-        # reference_pixels are temporally downsampled: [0, 1, ..., 24] -> [0]+[1..8]+[9..16]+[17..24], take 0, 8, 16, 24
-        # ic-lora format: [cond[0]] [cond[1]] ... [cond[-1]] [ref[0]] [ref[8]] [ref[16]] [ref[24]] [noise[0]..noise[24]]
-        # -- t ->
-        # [f tokens] + [r tokens] + [latent_frames tokens]
-        # [       feature       ] + [        zeros       ]
+        noise = randn_like(target_latents, generator=generator)
 
-        target_latents = patchify(encode_as_video(self._vae, target_pixels)) # b c latent_frames latent_height latent_width
-        # condition_latents = patchify(encode_as_images(condition_pixels)) # b c f latent_height latent_width
-        # reference_latents = patchify(encode_as_images(reference_pixels)) # b c r latent_height latent_width
-        # target_to_reference_latents = patchify(encode_as_images(target_pixels[:, [i for i in range(0, t, t_compress)]]))
+        target_video_coords = indices_to_pixel_coords(patch_indices(patchify(target_latents)))
+        target_video_coords = rearrange(target_video_coords, 'b f h w c -> b c (f h w)').float()
+        target_video_coords[:, 0] = target_video_coords[:, 0] / frame_rate
+        video_coords = target_video_coords
 
-        # for an auxilary training target: predictions on the reference latent tokens should be consistent with corresponding frames in target pixels
-        # -- t ->      [=tgt2ref]
-        # [f tokens] + [r tokens] + [latent_frames tokens]
-        # [       feature       ] + [        zeros       ]
-        # [any]        [0,8,16,.]   [0,1,9,16,...        ]
+        if timestep_sampler is not None:
+            assert target_pixels is not None
+            # train; target pixels provided; add noise to target latents; may do first frame conditioning; set target_condition_mask[:, :, 0] = 1 if randomly selected
+            target_condition_mask[:, :, 0] = (torch.rand((b, 1, 1, 1), device=target_latents.device, generator=generator) < self.conditioning_config.first_frame_conditioning_p).to(target_latents)
 
-        # assemble masks, coords, latents
-        with target_latents.device:
-            # assemble latents
-            conditioning_latents = torch.cat([target_latents], dim=1) # b f+r+t h w c, clean
+            sigmas: Float[torch.Tensor, 'b'] = timestep_sampler.sample_for(tokenize(patchify(target_latents)))
+            # sigmas = torch.full_like(sigmas, fill_value=0.01)
+            applied_sigmas = torch.min(1 - target_condition_mask, rearrange(sigmas, 'b -> b 1 1 1 1')).to(target_latents) # b 128 f+r+t h w
+            hidden_states = torch.lerp(target_latents, noise, applied_sigmas) # as input:hidden_states, (batch_size num_tokens, 128)
+            # hidden_states = (1 - applied_sigmas) * target_latents + applied_sigmas * noise # as input:hidden_states, (batch_size num_tokens, 128)
 
-            sigmas: Float[torch.Tensor, 'b'] = timestep_sampler.sample_for(tokenize(conditioning_latents))
-            sampled_timestep_values: Integer[torch.Tensor, 'b'] = torch.round(sigmas * 1000.0).long()
+            # sigmas: Float[torch.Tensor, 'b'] = timestep_sampler.sample_for(tokenize(patchify(target_latents)))
+            # noisy_latents = (1 - sigmas.view(b, 1, 1, 1, 1)) * target_latents + sigmas.view(b, 1, 1, 1, 1) * noise
+            # hidden_states = torch.where(
+            #     target_condition_mask > 1 - 1e-3,
+            #     target_latents,
+            #     noisy_latents,
+            # )
+            # applied_sigmas = torch.min(1 - target_condition_mask, rearrange(sigmas, 'b -> b 1 1 1 1')).to(target_latents) # b 128 f+r+t h w
 
-            # assemble coords
-            target_indices = patch_indices(target_latents)
-            target_coords = indices_to_pixel_coords(target_indices) # Float[torch.Tensor, 'b f h w c=3'], 以像素为单位的 latent 格子坐标
+            model_pred = noise - target_latents # as prediction target, (batch_size num_tokens, 128)
+            # model_pred = target_latents - noise # as prediction target, (batch_size num_tokens, 128)
+            # model_pred = noise # as prediction target, (batch_size num_tokens, 128)
+            # model_pred = noise - target_latents # as prediction target, (batch_size num_tokens, 128)
+            # model_pred = noise - target_latents # as prediction target, (batch_size num_tokens, 128)
 
-            # reference_indices = patch_indices(reference_latents)
-            # reference_coords = reference_indices * torch.tensor([t_compress, s_compress, s_compress])
+            condition_mask = target_condition_mask
+        else:
+            # inference; target pixels not provided; no additional noise; may do first frame conditioning; set target_condition_mask[:, :, 0] = 1 if first_frame_pixels is provided
+            if first_frame_pixels is not None:
+                first_frame_latents = encode_as_video(self._vae, first_frame_pixels)
+                target_latents[:, :, 0:first_frame_latents.size(2), :, :] = first_frame_latents
+                target_condition_mask[:, :, 0:first_frame_latents.size(2), :, :] = 1 # b c latent_frames latent_height latent_width
+            applied_sigmas = 1 - target_condition_mask # b 128 f+r+t h w
 
-            # condition_indices = torch.stack(torch.meshgrid(
-            #     torch.arange(-f, 0), torch.arange(latent_height), torch.arange(latent_width), indexing='ij'
-            # ), dim=-1).unsqueeze(0).repeat(b, 1, 1, 1, 1) # b f h w 3
-            # condition_coords = condition_indices * torch.tensor([t_compress, s_compress, s_compress])
+            hidden_states = target_latents # as input:hidden_states
+            model_pred = None # as prediction target
+            condition_mask = target_condition_mask
 
-            fps = torch.tensor(10.0) # override input video fps
-            manual_token_coords = torch.cat([target_coords], dim=1) # b f+r+t h w 3
-            manual_token_coords = rearrange(manual_token_coords, 'b frt h w c -> b c (frt h w)').float()
-            manual_token_coords[:, 0] /= (fps + torch.rand_like(fps) * 10)
+        if target_pixels is not None:
+            with torch.no_grad():
+                pi3_input_images = self._pi3_transform(target_pixels[:, [max(i-t_compress+1, 0) for i in range(0, t+t_compress-1, t_compress)]]) # b latent_frames c h w
+                pi3_input_images = F.interpolate(rearrange(pi3_input_images, 'b t c h w -> (b t) c h w'), size=(latent_height*14, latent_width*14), mode='bicubic', align_corners=False, antialias=True)
+                encoder_feature, decoder_feature = self.pi3_feature(rearrange(pi3_input_images.to(self._vae.dtype), '(b t) c h w -> b t c h w', b=b)) # b latent_frames latent_height latent_width c
+                latents_add = rearrange(decoder_feature, 'b t h w d -> b (t h w) d')
+        else:
+            latents_add = None
 
-            # assemble masks
-            target_mask = torch.zeros((b, 1, latent_frames, latent_height, latent_width), dtype=torch.bool)
-            target_mask[:, :, 0] = (torch.rand((b, 1, 1, 1)) < self.conditioning_config.first_frame_conditioning_p) # apply random first frame conditioning
-            # condition_reference_mask = torch.ones((b, 1, f + r, latent_height, latent_width))
-            conditioning_mask = torch.cat([target_mask.float()], dim=2) # b 1 f+r+t h w
+        # TODO: add condition and reference
 
-            # from gshub.utils import describe
-            # now, add noise to latents.
-            # conditioning_latents is somewhat like the target.
-            # with a small probability, all the conditioning latents will be mixed with noise;
-            # otherwise, conditioning_mask=1 means not mix, conditioning_mask=0 means mix with weight sigma
-            noise = torch.randn_like(conditioning_latents)
-            applied_sigmas = torch.min(1 - conditioning_mask, rearrange(sigmas, 'b -> b 1 1 1 1')) # b 1 f+r+t h w
-            applied_sigmas = torch.where((torch.rand((b, 1, 1, 1, 1)) < 0.1), sigmas.view(b, 1, 1, 1, 1), applied_sigmas)
-            applied_sigmas = rearrange(applied_sigmas.to(conditioning_latents), 'b c t h w -> b t h w c') # c=1, somewhat like patchified conditioning_mask
+        # print(applied_sigmas.mean(dim=(1,3,4))*1000)
 
-            # print(f"{applied_sigmas=}")
-            noisy_target = torch.lerp(conditioning_latents, noise, applied_sigmas) # as input:hidden_states
-            targets = noise - conditioning_latents # as prediction target
-            # targets = conditioning_latents - noise # as prediction target
+        context = {
+            'hidden_states': tokenize(patchify(hidden_states)),
+            'timestep': tokenize(patchify(applied_sigmas)).mean(-1) * 1000,
+            'video_coords': video_coords,
+            'latents_add': latents_add,
 
-        # {
-        #     'hidden_states': 'Tensor([1, 9600, 128],torch.bfloat16,cuda:0)',
-        #     'encoder_hidden_states': 'Tensor([1, 256, 4096],torch.float16,cuda:0)',
-        #     'encoder_attention_mask': 'Tensor([1, 256],torch.bool,cuda:0)',
-        #     'video_coords': 'Tensor([1, 3, 9600],torch.float32,cuda:0)',
-        #     'timestep': 'Tensor([1, 9600],torch.bfloat16,cuda:0)',
-        #     'targets': 'Tensor([1, 9600, 128],torch.bfloat16,cuda:0)',
-        #     'conditioning_latents': 'Tensor([1, 128, 16, 20, 30],torch.bfloat16,cuda:0)',
-        #     'conditioning_mask': 'Tensor([1, 1, 16, 20, 30],torch.float32,cuda:0)',
-        #     'feature': 'Tensor([1, 12, 20, 30, 2048],torch.bfloat16,cuda:0)',
-        # }
-
-        target_seq_len = (latent_frames + 0) * latent_height * latent_width
-        return {
-            'encoder_hidden_states': prompt_embeds,
-            'encoder_attention_mask': prompt_attention_mask,
-
-            'video_coords': manual_token_coords[:, :, -target_seq_len:],
-            'hidden_states': tokenize(noisy_target)[:, -target_seq_len:],
-            'timestep': 1000 * tokenize(applied_sigmas).squeeze(-1)[:, -target_seq_len:],
-
-            # tokenized targets
-            'targets': tokenize(targets)[:, -target_seq_len:],
-            # unpatchified
-            'conditioning_latents': rearrange(conditioning_latents, 'b fp hp wp (c pf ph pw) -> b c (fp pf) (hp ph) (wp pw)', pf=1, ph=1, pw=1), # b c f+r+t h w
-            # never patchified
-            'conditioning_mask': conditioning_mask[:, :, -latent_frames:], # b 1 f+r+t h w
-            'feature': feature, # b t h w 1024
-
-            'latent_frames': latent_frames,
-            'latent_height': latent_height,
-            'latent_width': latent_width,
+            'condition_mask': tokenize(patchify(condition_mask)),
+            'model_pred': tokenize(patchify(model_pred)), # not the input to the model, but the training target
+            'noise': tokenize(patchify(noise)),
         }
+        # print(f"{describe(context)=}")
+        return context
 
-    def prepare_model_inputs(self, batch: CustomTrainingBatch):
-        model_inputs = {
-            k: v for k, v in batch.items()
-            if k in 'hidden_states encoder_hidden_states encoder_attention_mask video_coords timestep'.split()
-        }
-        model_inputs['latents_add'] = rearrange(batch['feature'], 'b t h w d -> b (t h w) d')
-        return model_inputs
-
-    def compute_loss(self, model_pred: Float[torch.Tensor, 'b n c'], batch: CustomTrainingBatch) -> torch.Tensor:
-        """Compute masked loss only on target portion, excluding conditioning tokens."""
-        # Extract target portion from model prediction and conditioning mask
-        latent_frames = batch['latent_frames']
-        latent_height = batch['latent_height']
-        latent_width = batch['latent_width']
-        target_seq_len = latent_frames * latent_height * latent_width
-
-        target_pred = model_pred[:, -target_seq_len:]
-        target_conditioning_mask = tokenize(patchify(batch['conditioning_mask']))[:, -target_seq_len:]
-
-        # print(f"{describe(target_pred)=}")
-        # print(f"{describe(batch['targets'])=}")
-
-        loss = (target_pred - batch['targets'][:, -target_seq_len:]).pow(2)
-        # Create loss mask: exclude conditioning tokens
-        loss_mask = (1 - target_conditioning_mask).float()
-        # Apply original loss computation pattern
-        loss = loss.mul(loss_mask).div(loss_mask.mean())
-        return loss.mean()
+    # @torch.no_grad()
+    # def prepare_batch(self, batch: CustomDL3DV10KDatasetBatch, timestep_sampler: TimestepSampler) -> CustomTrainingBatch:
+    #     prompt_embeds = batch["prompt_embeds"] # b s=256 c=4096
+    #     prompt_attention_mask = batch["prompt_attention_mask"] # b s=256
+    #     target_pixels: Float[torch.Tensor, 'b t c h w'] = batch['target_pixels'] # ground truth, 30fps, 25 frames
+    #     context = self.prepare_context(
+    #         target_pixels=target_pixels,
+    #         timestep_sampler=timestep_sampler,
+    #         frame_rate=25,
+    #     )
+    #     return {
+    #         'hidden_states': context['hidden_states'],
+    #         'encoder_hidden_states': prompt_embeds,
+    #         'encoder_attention_mask': prompt_attention_mask,
+    #         'timestep': context['timestep'],
+    #         'video_coords': context['video_coords'],
+    #         'latents_add': context.get('latents_add', None), # b (t h w) 1024/2048
+    #         'model_pred': context['model_pred'], # b (t h w) c
+    #         'condition_mask': context['condition_mask'], # b (t h w) c
+    #         'noise': context['noise'], # b (t h w) c
+    #     }
+    # def prepare_model_inputs(self, batch: CustomTrainingBatch):
+    #     model_inputs = {
+    #         k: v for k, v in batch.items()
+    #         if k in 'hidden_states encoder_hidden_states encoder_attention_mask video_coords timestep latents_add'.split()
+    #     }
+    #     return model_inputs
+    # def compute_loss(self, model_pred: Float[torch.Tensor, 'b n c'], batch: CustomTrainingBatch) -> torch.Tensor:
+    #     """Compute masked loss only on target portion, excluding conditioning tokens."""
+    #     loss = (model_pred - batch['model_pred']).pow(2)
+    #     # Create loss mask: exclude conditioning tokens
+    #     loss_mask = (1 - batch['condition_mask']).float()
+    #     # Apply original loss computation pattern
+    #     loss = loss.mul(loss_mask).div(loss_mask.mean() + 1e-3)
+    #     return loss.mean()
 
 class CustomPi3EncoderProbeTrainer(LtxvTrainer):
     def _prepare_models_for_training(self) -> None:
@@ -1054,7 +1218,7 @@ class CustomPi3EncoderProbeTrainer(LtxvTrainer):
     def _compile_transformer(self) -> None:
         """Compile the transformer model with Torch Inductor."""
         super()._compile_transformer()
-
+        torch._dynamo.config.capture_scalar_outputs = True
         # compile_module = functools.partial(torch.compile, mode=self._config.acceleration.compilation_mode)
         # self._pi3.encoder.blocks = nn.ModuleList([compile_module(block) for block in self._pi3.encoder.blocks]) # type: ignore
         # self._pi3.decoder = nn.ModuleList([compile_module(block) for block in self._pi3.decoder]) # type: ignore
@@ -1109,19 +1273,27 @@ class CustomPi3EncoderProbeTrainer(LtxvTrainer):
             self._transformer.requires_grad_(True)
         else:
             raise ValueError(f"Unknown training mode: {self._config.model.training_mode}")
-        self._transformer.latents_add_proj_in.requires_grad_(True)
 
-        # self._trainable_params = [p for p in self._transformer.parameters() if p.requires_grad]
-        self._trainable_params = [p for p in self._transformer.latents_add_proj_in.parameters() if p.requires_grad]
+        if self._transformer.latents_add_proj_in is not None:
+            self._transformer.latents_add_proj_in.requires_grad_(True)
+
+        self._trainable_params = [p for p in self._transformer.parameters() if p.requires_grad]
+        # self._trainable_params = [p for p in self._transformer.latents_add_proj_in.parameters() if p.requires_grad]
         logger.debug(f"Trainable params count: {sum(p.numel() for p in self._trainable_params):,}")
 
     def _init_dataloader(self) -> None:
         """Initialize the training data loader using the strategy's data sources."""
         if self._dataset is None:
+            width, height, frames = self._config.validation.video_dims
             self._dataset = CustomDL3DV10KDataset(
-                self._config.data.preprocessed_data_root, num_frames=25, num_cond_frames=8, resolution=(640, 960),
+                # self._config.data.preprocessed_data_root, num_frames=25, num_cond_frames=8, resolution=(640, 960),
+                self._config.data.preprocessed_data_root, num_frames=frames, num_cond_frames=8, resolution=(height, width),
                 discrete_reference_indices=False, discrete_condition_indices=True,
             )
+            # self._dataset = LTXVDataset(
+            #     self._config.data.preprocessed_data_root, num_frames=frames, num_cond_frames=8, resolution=(height, width),
+            #     discrete_reference_indices=False, discrete_condition_indices=True,
+            # )
             logger.debug(f"Loaded dataset with {len(self._dataset):,} samples from {self._dataset}")
 
         dataloader = DataLoader(
@@ -1149,6 +1321,29 @@ class CustomPi3EncoderProbeTrainer(LtxvTrainer):
 
         # Use strategy to compute loss
         loss = self._training_strategy.compute_loss(model_pred, training_batch)
+
+        # print(f"{loss.item()=:.4f} {training_batch['timestep'].mean().item()=:.3f}")
+        # print(f"{training_batch['model_pred'].reshape(1, -1, 20*30, 128).std(dim=(2, 3))=}")
+        # print(f"{training_batch['hidden_states'].reshape(1, -1, 20*30, 128).std(dim=(2, 3))=}")
+        # hidden_states = training_batch['hidden_states'].reshape(1, -1, 20*30, 128)[:, 1:].reshape(-1).float()
+        # noise = training_batch['noise'].reshape(1, -1, 20*30, 128)[:, 1:].reshape(-1).float()
+        # X = torch.stack([hidden_states, noise], dim=1)
+        # w = torch.linalg.lstsq(X, model_pred.reshape(1, -1, 20*30, 128)[:, 1:].reshape(-1).float()).solution
+        # print(f"{w=}")
+
+        # def _compute_loss(target):
+        #     loss = (model_pred - target).pow(2)
+        #     # Create loss mask: exclude conditioning tokens
+        #     loss_mask = (1 - training_batch['condition_mask']).float()
+        #     # Apply original loss computation pattern
+        #     loss = loss.mul(loss_mask).div(loss_mask.mean() + 1e-3)
+        #     return loss.mean()
+        # print(f"="*20)
+        # print(f"{loss.item()=:.4f} {training_batch['timestep'].mean().item()=:.3f}")
+        # print(f"{_compute_loss(training_batch['model_pred']).item():.4f}")
+        # print(f"{_compute_loss(training_batch['hidden_states']).item():.4f}")
+        # print(f"{_compute_loss(training_batch['noise']).item():.4f}")
+        # print(f"{_compute_loss(training_batch['noise']-training_batch['hidden_states']).item():.4f}")
 
         return loss
 
@@ -1200,66 +1395,89 @@ class CustomPi3EncoderProbeTrainer(LtxvTrainer):
             latent_frames = (frames - 1) // 8 + 1
             latent_height = height //32
             latent_width = width // 32
-
             with self._accelerator.device: # type: ignore
-                latents = torch.randn((batch_size, latent_channels, latent_frames, latent_height, latent_width), generator=generator)
-                latent_coords = rearrange(indices_to_pixel_coords(patch_indices(patchify(latents))), 'b f h w c -> b c (f h w)').float()
-            latent_coords[:, 0] = latent_coords[:, 0] / 25
+                context_kwargs = {
+                    'video_dims': self._config.validation.video_dims,
+                    'generator': generator,
+                    'timestep_sampler': None,
+                    'frame_rate': self._training_strategy._override_frame_rate or self._training_strategy._default_frame_rate,
+                }
 
-            if sample.reference_video is not None:
-                pass # TODO: requires special treatments defined by self._training_strategy
-            if sample.condition_video is not None:
-                pass # TODO: requires special treatments defined by self._training_strategy
+                if sample.first_frame is not None:
+                    if isinstance(sample.first_frame, str):
+                        first_frames = torch.as_tensor(iio.imread(sample.first_frame)).to(self._accelerator.device).float()[None].permute(0,3,1,2) / 255
+                    else:
+                        video_decoder = VideoDecoder(sample.first_frame.path, dimension_order='NCHW')
+                        first_frames = video_decoder[sample.first_frame.index:sample.first_frame.index+1].to(self._accelerator.device).float() / 255
+                    first_frames = F.interpolate(first_frames, size=(height, width), mode='bicubic', align_corners=False, antialias=True).to(self._vae.dtype) # t c h w
+                    context_kwargs['first_frame_pixels'] = first_frames[None, 0:frames]
 
-            if sample.first_frame is not None:
-                with self._accelerator.device: # type: ignore
-                    condition_latents = torch.randn((batch_size, latent_channels, latent_frames, latent_height, latent_width), generator=generator)
-                    condition_mask = torch.zeros((batch_size, 1, latent_frames, latent_height, latent_width))
+                if sample.target_video is not None:
+                    target_video_path = sample.target_video if isinstance(sample.target_video, str) else sample.target_video.path
+                    target_video_slice = slice(None, None, None) if isinstance(sample.target_video, str) else slice(sample.target_video.start, sample.target_video.end, sample.target_video.step)
 
-                if isinstance(sample.first_frame, str):
-                    # load first_frame image from an image file
-                    first_frames = torch.as_tensor(iio.imread(sample.first_frame)).to(self._accelerator.device).float()[None].expand(-1, -1, -1, -1) / 255
-                else:
-                    video_decoder = VideoDecoder(sample.first_frame.path, dimension_order='NHWC')
-                    first_frames = video_decoder[sample.first_frame.index:sample.first_frame.index+1].to(self._accelerator.device).float() / 255
-                first_frames = F.interpolate(first_frames.permute(0,3,1,2), size=(height, width), mode='bicubic', align_corners=False, antialias=True).to(self._vae.dtype) # t c h w
-                first_frame_latents = encode_as_video(self._vae, first_frames[None])
-                condition_latents[:, :, 0:1] = first_frame_latents[:, :, 0:1]
-                condition_mask[:, :, 0:1] = 1
-                conditioning = (
-                    tokenize(patchify(condition_latents)),
-                    tokenize(patchify(condition_mask.expand(-1, 128, -1, -1, -1)))
-                )
-            else:
-                conditioning = None
-            image_cond_noise_scale = 0.15
+                    target_video_decoder = VideoDecoder(target_video_path, dimension_order='NCHW')
+                    target_pixels = target_video_decoder[target_video_slice].to(self._accelerator.device).float() / 255
+                    target_pixels = F.interpolate(target_pixels, size=(height, width), mode='bicubic', align_corners=False, antialias=True).to(self._vae.dtype) # t c h w
+                    context_kwargs['target_pixels'] = target_pixels[None, 0:frames]
+                
+                if sample.reference_video is not None:
+                    reference_video_path = sample.reference_video if isinstance(sample.reference_video, str) else sample.reference_video.path
+                    reference_video_slice = slice(None, None, None) if isinstance(sample.reference_video, str) else slice(sample.reference_video.start, sample.reference_video.end, sample.reference_video.step)
+
+                    reference_video_decoder = VideoDecoder(reference_video_path, dimension_order='NCHW')
+                    reference_pixels = reference_video_decoder[reference_video_slice].to(self._accelerator.device).float() / 255
+                    reference_pixels = F.interpolate(reference_pixels, size=(height, width), mode='bicubic', align_corners=False, antialias=True).to(self._vae.dtype)
+                    context_kwargs['reference_pixels'] = reference_pixels[None, 0:frames]
+
+                context = self._training_strategy.prepare_context(**context_kwargs)
+                context = {k: (v.to(cast(torch.dtype, self._transformer.dtype)) if isinstance(v, torch.Tensor) else v) for k, v in context.items()}
 
             with torch.amp.autocast(self._accelerator.device.type, dtype=torch.bfloat16):
-                # result = pipeline(**pipeline_inputs)
-                # videos = result.frames
-                # latents = pipeline.sample_latents(**pipeline_inputs, device=self._accelerator.device)
                 latents = pipeline.latents_sample_loop(
-                    latents=tokenize(patchify(latents)),
-                    latent_coords=latent_coords,
+                    latents=context['hidden_states'],
+                    latent_coords=context['video_coords'],
                     prompt_embeds=prompt_embeds['prompt_embeds'],
                     prompt_attention_mask=prompt_embeds['prompt_attention_mask'],
                     negative_prompt_embeds=negative_prompts['prompt_embeds'],
                     negative_prompt_attention_mask=negative_prompts['prompt_attention_mask'],
                     num_inference_steps=self._config.validation.inference_steps,
-                    conditioning=conditioning,
+                    conditioning=(context['hidden_states'], context['condition_mask']) if 'condition_mask' in context else None,
+                    latents_add=context.get('latents_add', None),
                 )
                 latents = rearrange(latents, 'b (fp hp wp) (c pf ph pw) -> b c (fp pf) (hp ph) (wp pw)', fp=latent_frames, hp=latent_height, wp=latent_width, pf=1, ph=1, pw=1)
-
                 videos = pipeline.sample_videos(latents, device=self._accelerator.device)
-                # first_frame = pipeline.sample_videos(first_frame_latents, device=self._accelerator.device)
+
+                # with torch.no_grad():
+                #     # one-step denoising
+                #     # one_step = pipeline.latents_sample_loop(
+                #     #     latents=context['hidden_states'],
+                #     #     latent_coords=context['video_coords'],
+                #     #     prompt_embeds=prompt_embeds['prompt_embeds'],
+                #     #     prompt_attention_mask=prompt_embeds['prompt_attention_mask'],
+                #     #     negative_prompt_embeds=negative_prompts['prompt_embeds'],
+                #     #     negative_prompt_attention_mask=negative_prompts['prompt_attention_mask'],
+                #     #     num_inference_steps=1,
+                #     #     conditioning=(context['hidden_states'], context['condition_mask']) if 'condition_mask' in context else None,
+                #     #     latents_add=context.get('latents_add', None),
+                #     # )
+                #     # one_step = rearrange(one_step, 'b (fp hp wp) (c pf ph pw) -> b c (fp pf) (hp ph) (wp pw)', fp=latent_frames, hp=latent_height, wp=latent_width, pf=1, ph=1, pw=1)
+                #     model_pred = cast(TokenizedLatents, self._transformer(
+                #         hidden_states=context['hidden_states'],
+                #         encoder_hidden_states=prompt_embeds['prompt_embeds'],
+                #         encoder_attention_mask=prompt_embeds['prompt_attention_mask'],
+                #         video_coords=context['video_coords'],
+                #         timestep=context['timestep'],
+                #         latents_add=context.get('latents_add', None),
+                #         return_dict=True
+                #     ).sample) # model_pred should be equal to noise - target_latents; target_latents = noise - model_pred
+                #     one_step = context['hidden_states'] + model_pred
+                #     one_step = rearrange(one_step, 'b (fp hp wp) (c pf ph pw) -> b c (fp pf) (hp ph) (wp pw)', fp=latent_frames, hp=latent_height, wp=latent_width, pf=1, ph=1, pw=1)
+                # videos = pipeline.sample_videos(one_step, device=self._accelerator.device)
 
             for video in videos:
                 video_path = output_dir / f"step_{self._global_step:06d}_{i}.mp4"
-                # export_to_video(video, str(video_path), fps=24)
                 torchvision.io.write_video(str(video_path), video.permute(1,2,3,0).clamp(0,1).cpu()*255, fps=24, options={'crf': '20'})
-
-                # video_path = output_dir / f"step_{self._global_step:06d}_{i}_first_frame.mp4"
-                # torchvision.io.write_video(str(video_path), first_frame.permute(1,2,3,0).clamp(0,1).cpu()*255, fps=24, options={'crf': '20'})
                 video_paths.append(video_path)
                 i += 1
             progress.update(task, advance=1)
@@ -1312,14 +1530,17 @@ if __name__ == "__main__":
         # trainer = CustomTrainer(trainer_config)
         trainer = CustomPi3EncoderProbeTrainer(trainer_config)
         setattr(trainer, 'config_path', config_path)
-        sample_progress = Progress(
-            TextColumn("Sampling validation videos"),
-            MofNCompleteColumn(),
-            BarColumn(bar_width=40, style="blue"),
-            TimeElapsedColumn(),
-            TextColumn("ETA:"),
-            TimeRemainingColumn(compact=True),
-        )
+        print(f"{trainer._scheduler.sigmas=}")
+        print(f"{trainer._scheduler.config.get('stochastic_sampling', None)}")
+
+        # sample_progress = Progress(
+        #     TextColumn("Sampling validation videos"),
+        #     MofNCompleteColumn(),
+        #     BarColumn(bar_width=40, style="blue"),
+        #     TimeElapsedColumn(),
+        #     TextColumn("ETA:"),
+        #     TimeRemainingColumn(compact=True),
+        # )
         # trainer._sample_videos(sample_progress)
 
         # from gshub.utils import describe

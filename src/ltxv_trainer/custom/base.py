@@ -109,6 +109,55 @@ def encode_video_as_image_dict(vae: AutoencoderKLLTXVideo, video: Float[torch.Te
         'width': width
     }
 
+import decord
+import numpy as np
+from torchvision.transforms import InterpolationMode
+from torchvision.transforms.functional import crop, resize, to_tensor
+def ltxv_resize_and_crop(arr: torch.Tensor, image_size: tuple[int, int], reshape_mode='center') -> torch.Tensor:
+    """Resize and crop tensor to target size."""
+    if arr.shape[3] / arr.shape[2] > image_size[1] / image_size[0]:
+        arr = resize(arr, size=[image_size[0], int(arr.shape[3] * image_size[0] / arr.shape[2])], interpolation=InterpolationMode.BICUBIC)
+    else:
+        arr = resize(arr, size=[int(arr.shape[2] * image_size[1] / arr.shape[3]), image_size[1]], interpolation=InterpolationMode.BICUBIC)
+    h, w = arr.shape[2], arr.shape[3]
+    arr = arr.squeeze(0)
+    delta_h = h - image_size[0]
+    delta_w = w - image_size[1]
+    if reshape_mode == "random":
+        top = np.random.randint(0, delta_h + 1)
+        left = np.random.randint(0, delta_w + 1)
+    elif reshape_mode == "center":
+        top, left = delta_h // 2, delta_w // 2
+    else:
+        raise ValueError(f"Unsupported reshape mode: {reshape_mode}")
+    arr = crop(arr, top=top, left=left, height=image_size[0], width=image_size[1])
+    return arr
+
+def ltxv_preprocess_video(path: Path, num_frames=41, resolution=(640, 960)) -> tuple[torch.Tensor, float]:
+    """Preprocess a video by loading, resizing, and applying transforms."""
+    transforms = torchvision.transforms.Compose(
+        [
+            torchvision.transforms.Lambda(lambda x: x.clamp_(0, 1)),
+            torchvision.transforms.Normalize(mean=[0.5, 0.5, 0.5], std=[0.5, 0.5, 0.5]),
+        ]
+    )
+
+    video_reader = decord.VideoReader(uri=path.as_posix())
+    video_num_frames = len(video_reader)
+    fps = video_reader.get_avg_fps()
+
+    frame_indices = list(range(video_num_frames))
+    frames = video_reader.get_batch(frame_indices)
+    if isinstance(frames, decord.ndarray.NDArray):
+        frames = torch.from_numpy(frames.asnumpy())
+    frames = frames[:num_frames].float() / 255.0
+    frames = frames.permute(0, 3, 1, 2).contiguous()
+
+    frames_resized = ltxv_resize_and_crop(frames, resolution)
+    frames = torch.stack([transforms(frame) for frame in frames_resized], dim=0)
+
+    return frames, fps
+
 class CustomDL3DV10KDatasetBatch(TypedDict):
     target_pixels: Float[torch.Tensor, 'b t c h w']
     fps: float | None
@@ -137,6 +186,7 @@ class CustomDL3DV10KDataset(Dataset):
         self.data_root = Path(data_root)
         assert self.data_root.is_dir(), f"Data root {data_root} is not a directory."
         self.items = [d for d in self.data_root.iterdir() if (d / '.done').exists()]
+        self.items = [d for d in self.items if (d / 'prompt.pt').is_file()]
         self.num_frames = num_frames
         self.num_cond_frames = num_cond_frames
         self.resolution = resolution
@@ -165,7 +215,7 @@ class CustomDL3DV10KDataset(Dataset):
         return self._discrete_condition_indices
 
     def random_slice(self, length: int, total_length: int):
-        slice_start = random.randint(0, total_length - 1 - length)
+        slice_start = random.randint(0, total_length - length)
         slice_stop = slice_start + self.num_frames
         return slice(slice_start, slice_stop)
 
@@ -173,33 +223,34 @@ class CustomDL3DV10KDataset(Dataset):
         return torch.randperm(total_length)[:length].tolist()
 
     def __getitem__(self, index: int):
-        item_dir = self.items[index]
-        camera_params = torch.load(item_dir / 'camera_params.pth')
-        extrinsics: Float[torch.Tensor, 'n 4 4'] = camera_params['extrinsics'] # n 4 4, c2w
-        intrinsics: Float[torch.Tensor, 'n 3 3'] = camera_params['intrinsics'] # n 3 3
-        total_frames = intrinsics.size(0)
+        item_dir = self.items[index % len(self)]
+        # camera_params = torch.load(item_dir / 'camera_params.pth')
+        # extrinsics: Float[torch.Tensor, 'n 4 4'] = camera_params['extrinsics'] # n 4 4, c2w
+        # intrinsics: Float[torch.Tensor, 'n 3 3'] = camera_params['intrinsics'] # n 3 3
+        # total_frames = intrinsics.size(0)
 
-        if total_frames <= 32:
+        ground_truth_decoder = VideoDecoder(item_dir / 'ground_truth.mp4')
+        ref_pixels_decoder = VideoDecoder(item_dir / 'render_pixels.mp4')
+        # ref_depths_decoder = VideoDecoder(item_dir / 'render_depths.mp4')
+        total_frames = min(ground_truth_decoder.metadata.num_frames, ref_pixels_decoder.metadata.num_frames)
+
+        if total_frames < self.num_frames:
             print(f"Error: too few frames ({total_frames}) in {item_dir}.")
             self.items.pop(index)
             return self[index % len(self)]
 
-        ground_truth_decoder = VideoDecoder(item_dir / 'ground_truth.mp4')
-        ref_pixels_decoder = VideoDecoder(item_dir / 'render_pixels.mp4')
-        ref_depths_decoder = VideoDecoder(item_dir / 'render_depths.mp4')
-
         if self.discrete_reference_indices:
             ref_selection = self.random_indices(self.num_cond_frames, total_frames)
             reference_pixels = ref_pixels_decoder.get_frames_at(indices=ref_selection).data
-            reference_depths = ref_depths_decoder.get_frames_at(indices=ref_selection).data
+            # reference_depths = ref_depths_decoder.get_frames_at(indices=ref_selection).data
             target_pixels = ground_truth_decoder.get_frames_at(indices=ref_selection).data
         else:
             ref_selection = self.random_slice(self.num_frames, total_frames)
             reference_pixels = ref_pixels_decoder[ref_selection]
-            reference_depths = ref_depths_decoder[ref_selection]
+            # reference_depths = ref_depths_decoder[ref_selection]
             target_pixels = ground_truth_decoder[ref_selection]
-        reference_extrinsics = extrinsics[ref_selection]
-        reference_intrinsics = intrinsics[ref_selection]
+        # reference_extrinsics = extrinsics[ref_selection]
+        # reference_intrinsics = intrinsics[ref_selection]
 
         if self.discrete_condition_indices:
             cond_selection = self.random_indices(self.num_cond_frames, total_frames)
@@ -207,8 +258,8 @@ class CustomDL3DV10KDataset(Dataset):
         else:
             cond_selection = self.random_slice(self.num_cond_frames, total_frames)
             condition_pixels = ground_truth_decoder[cond_selection]
-        condition_extrinsics = extrinsics[cond_selection]
-        condition_intrinsics = intrinsics[cond_selection]
+        # condition_extrinsics = extrinsics[cond_selection]
+        # condition_intrinsics = intrinsics[cond_selection]
 
         if (item_dir / 'prompt.pt').is_file():
             prompt = torch.load(item_dir / 'prompt.pt')
@@ -223,13 +274,13 @@ class CustomDL3DV10KDataset(Dataset):
             'target_pixels': F.interpolate(target_pixels.float() / 255, size=self.resolution, mode='bilinear', align_corners=False), # t c h w
 
             'reference_pixels': F.interpolate(reference_pixels.float() / 255, size=self.resolution, mode='bilinear', align_corners=False), # t c h w
-            'reference_depths': F.interpolate(reference_depths.float() / 255, size=self.resolution, mode='bilinear', align_corners=False), # t c h w
-            'reference_extrinsics': reference_extrinsics, # t 4 4
-            'reference_intrinsics': reference_intrinsics, # t 3 3
+            # 'reference_depths': F.interpolate(reference_depths.float() / 255, size=self.resolution, mode='bilinear', align_corners=False), # t c h w
+            # 'reference_extrinsics': reference_extrinsics, # t 4 4
+            # 'reference_intrinsics': reference_intrinsics, # t 3 3
 
             'condition_pixels': F.interpolate(condition_pixels.float() / 255, size=self.resolution, mode='bilinear', align_corners=False), # r c h w
-            'condition_extrinsics': condition_extrinsics, # r 4 4
-            'condition_intrinsics': condition_intrinsics, # r 3 3
+            # 'condition_extrinsics': condition_extrinsics, # r 4 4
+            # 'condition_intrinsics': condition_intrinsics, # r 3 3
         }
 
 
