@@ -245,41 +245,6 @@ class TransformersVlmCaptioner(MediaCaptioningModel):
             max_pixels=64 * 28 * 28,
         )
 
-@torch.no_grad()
-def encode_prompts(tokenizer, text_encoder, prompts: Prompts, max_sequence_length: int = 256, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None) -> TextEmbeds:
-    if isinstance(prompts, list):
-        tokenizer, text_encoder = not_none(tokenizer), not_none(text_encoder)
-        device, dtype = (device or text_encoder.device), (dtype or text_encoder.dtype)
-        text_inputs = tokenizer(
-            prompts, padding="max_length", max_length=max_sequence_length,
-            truncation=True, add_special_tokens=True, return_tensors="pt",
-        )
-        prompt_attention_mask = text_inputs.attention_mask.bool().to(text_encoder.device)
-        prompt_embeds = text_encoder(
-            text_inputs.input_ids.to(text_encoder.device),
-            attention_mask=prompt_attention_mask
-        ).last_hidden_state
-        prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
-        return {"prompt_embeds": prompt_embeds, "prompt_attention_mask": prompt_attention_mask.to(device)}
-    return {"prompt_embeds": prompts["prompt_embeds"].to(device=device, dtype=dtype), "prompt_attention_mask": prompts["prompt_attention_mask"].to(device=device)}
-
-@torch.no_grad()
-def encode_as_video(vae: AutoencoderKLLTXVideo, pixels: Float[torch.Tensor, 'b f c h w']) -> Float[torch.Tensor, 'b c latent_frames latent_height latent_width']:
-    latents_mean, latents_std, scaling_factor = vae.latents_mean, vae.latents_std, vae.config['scaling_factor']
-    latents_mean, latents_std = latents_mean.view(1, -1, 1, 1, 1), latents_std.view(1, -1, 1, 1, 1)
-    latents = rearrange(pixels, 'b f c h w -> b c f h w').to(vae.dtype)
-    latents = cast(AutoencoderKLOutput, vae.encode(latents*2-1, return_dict=True)).latent_dist.sample()
-    return (latents - latents_mean) / latents_std * scaling_factor
-
-@torch.no_grad()
-def encode_as_images(vae: AutoencoderKLLTXVideo, pixels: Float[torch.Tensor, 'b f c h w']) -> Float[torch.Tensor, 'b c f h w']:
-    latents_mean, latents_std, scaling_factor = vae.latents_mean, vae.latents_std, vae.config['scaling_factor']
-    latents_mean, latents_std = latents_mean.view(1, -1, 1, 1, 1), latents_std.view(1, -1, 1, 1, 1)
-    latents = rearrange(pixels, 'b f c h w -> (b f) c 1 h w').to(vae.dtype)
-    latents = cast(AutoencoderKLOutput, vae.encode(latents*2-1, return_dict=True)).latent_dist.sample()
-    latents = rearrange(latents, '(b f) c n h w -> b c (f n) h w', b=pixels.size(0))
-    return (latents - latents_mean) / latents_std * scaling_factor
-
 class SkipLayerStrategy(Enum):
     AttentionSkip = auto()
     AttentionValues = auto()
@@ -438,6 +403,16 @@ class LTXVideoTransformerBlock(_LTXVideoTransformerBlock):
         return hidden_states
 
 class LTXVideoTransformer3DModel(_LTXVideoTransformer3DModel):
+    def mocking_inputs(self, batch_size=3, num_tokens=20*30):
+        return {
+            'hidden_states': torch.randn((batch_size, num_tokens, self.config['in_channels'])),
+            'encoder_hidden_states': torch.randn((batch_size, 256, self.config['caption_channels'])),
+            'timestep': torch.randint(0, 1000, (batch_size, num_tokens), dtype=torch.long),
+            'encoder_attention_mask': torch.ones((batch_size, 256), dtype=torch.bool),
+            'rope_interpolation_scale': (1.0, 1.0, 1.0),
+            'video_coords': torch.rand((batch_size, 3, num_tokens))
+        }
+
     @register_to_config
     def __init__(
         self,
@@ -502,6 +477,8 @@ class LTXVideoTransformer3DModel(_LTXVideoTransformer3DModel):
 
         self.gradient_checkpointing = False
 
+        self.extra_modules = set()
+
         # We can add custom projection modules here.
         if latents_add_in_channels is not None:
             # TODO: apply
@@ -510,6 +487,7 @@ class LTXVideoTransformer3DModel(_LTXVideoTransformer3DModel):
             with torch.no_grad():
                 self.latents_add_proj_in.weight.data.zero_()
                 self.latents_add_proj_in.bias.data.zero_()
+            self.extra_modules.add('latents_add_proj_in')
         else:
             self.latents_add_proj_in = None
 
@@ -546,16 +524,6 @@ class LTXVideoTransformer3DModel(_LTXVideoTransformer3DModel):
         return_dict: Literal[False] = False,
         **kwargs,
     ) -> Tuple[Float[torch.Tensor, 'b fhw c']]: ...
-
-    def mocking_inputs(self, batch_size=3, num_tokens=20*30):
-        return {
-            'hidden_states': torch.randn((batch_size, num_tokens, self.config['in_channels'])),
-            'encoder_hidden_states': torch.randn((batch_size, 256, self.config['caption_channels'])),
-            'timestep': torch.randint(0, 1000, (batch_size, num_tokens), dtype=torch.long),
-            'encoder_attention_mask': torch.ones((batch_size, 256), dtype=torch.bool),
-            'rope_interpolation_scale': (1.0, 1.0, 1.0),
-            'video_coords': torch.rand((batch_size, 3, num_tokens))
-        }
 
     def forward(
         self,
@@ -640,6 +608,10 @@ class LTXVideoTransformer3DModel(_LTXVideoTransformer3DModel):
                     skip_layer_mask=skip_layer_mask[i] if skip_layer_mask is not None else None,
                     skip_layer_strategy=skip_layer_strategy,
                 )
+            
+            if kwargs.get('early_return', None) is not None:
+                if i == kwargs['early_return']:
+                    return hidden_states # type: ignore
 
         # [None, None, 2, inner_dim] + [batch_size num_tokens None inner_dim]
         scale_shift_values = self.scale_shift_table[None, None] + embedded_timestep[:, :, None]
@@ -760,6 +732,53 @@ Prompts = Union[TextEmbeds, List[str]]
 GuidanceScale = Union[torch.Tensor, float] # something that can be multiplied with latent tensor
 DynamicGuidanceScale = Callable[[Union[float, torch.Tensor]], GuidanceScale]
 GuidanceScaleSource = Union[DynamicGuidanceScale, GuidanceScale]
+
+@torch.no_grad()
+def encode_prompts(tokenizer, text_encoder, prompts: Prompts, max_sequence_length: int = 256, device: Optional[torch.device] = None, dtype: Optional[torch.dtype] = None) -> TextEmbeds:
+    if isinstance(prompts, list):
+        tokenizer, text_encoder = not_none(tokenizer), not_none(text_encoder)
+        device, dtype = (device or text_encoder.device), (dtype or text_encoder.dtype)
+        text_inputs = tokenizer(
+            prompts, padding="max_length", max_length=max_sequence_length,
+            truncation=True, add_special_tokens=True, return_tensors="pt",
+        )
+        prompt_attention_mask = text_inputs.attention_mask.bool().to(text_encoder.device)
+        prompt_embeds = text_encoder(
+            text_inputs.input_ids.to(text_encoder.device),
+            attention_mask=prompt_attention_mask
+        ).last_hidden_state
+        prompt_embeds = prompt_embeds.to(dtype=dtype, device=device)
+        return {"prompt_embeds": prompt_embeds, "prompt_attention_mask": prompt_attention_mask.to(device)}
+    return {"prompt_embeds": prompts["prompt_embeds"].to(device=device, dtype=dtype), "prompt_attention_mask": prompts["prompt_attention_mask"].to(device=device)}
+
+@overload
+def encode_as_video(vae: AutoencoderKLLTXVideo, pixels: Float[torch.Tensor, 'b f c h w']) -> Latents: ...
+
+@overload
+def encode_as_video(vae: AutoencoderKLLTXVideo, pixels: None) -> None: ...
+
+@torch.no_grad()
+def encode_as_video(vae: AutoencoderKLLTXVideo, pixels: Optional[Float[torch.Tensor, 'b f c h w']]) -> Optional[Latents]:
+    latents_mean, latents_std, scaling_factor = vae.latents_mean, vae.latents_std, vae.config['scaling_factor']
+    latents_mean, latents_std = latents_mean.view(1, -1, 1, 1, 1), latents_std.view(1, -1, 1, 1, 1)
+    latents = rearrange(pixels, 'b f c h w -> b c f h w').to(vae.dtype)
+    latents = cast(AutoencoderKLOutput, vae.encode(latents*2-1, return_dict=True)).latent_dist.sample()
+    return (latents - latents_mean) / latents_std * scaling_factor
+
+@overload
+def encode_as_images(vae: AutoencoderKLLTXVideo, pixels: Float[torch.Tensor, 'b f c h w']) -> Latents: ...
+
+@overload
+def encode_as_images(vae: AutoencoderKLLTXVideo, pixels: None) -> None: ...
+
+@torch.no_grad()
+def encode_as_images(vae: AutoencoderKLLTXVideo, pixels: Optional[Float[torch.Tensor, 'b f c h w']]) -> Optional[Latents]:
+    latents_mean, latents_std, scaling_factor = vae.latents_mean, vae.latents_std, vae.config['scaling_factor']
+    latents_mean, latents_std = latents_mean.view(1, -1, 1, 1, 1), latents_std.view(1, -1, 1, 1, 1)
+    latents = rearrange(pixels, 'b f c h w -> (b f) c 1 h w').to(vae.dtype)
+    latents = cast(AutoencoderKLOutput, vae.encode(latents*2-1, return_dict=True)).latent_dist.sample()
+    latents = rearrange(latents, '(b f) c n h w -> b c (f n) h w', b=pixels.size(0))
+    return (latents - latents_mean) / latents_std * scaling_factor
 
 class BaseLTXVPipeline:
     def set_progress_bar_config(self, disable):
@@ -901,18 +920,29 @@ class BaseLTXVPipeline:
             encoder_hidden_states_inputs = rearrange(full_encoder_hidden_states_inputs[indices], 'g b ... -> (g b) ...')
             encoder_attention_mask_inputs = rearrange(full_encoder_attention_mask_inputs[indices], 'g b ... -> (g b) ...')
 
-            noise_pred = cast(TokenizedLatents, self.transformer(
-                hidden_states=hidden_states_inputs,
-                encoder_hidden_states=encoder_hidden_states_inputs,
-                encoder_attention_mask=encoder_attention_mask_inputs,
-                video_coords=video_coords_inputs,
-                timestep=timestep_inputs,
+            try:
+                noise_pred = cast(TokenizedLatents, self.transformer(
+                    hidden_states=hidden_states_inputs,
+                    encoder_hidden_states=encoder_hidden_states_inputs,
+                    encoder_attention_mask=encoder_attention_mask_inputs,
+                    video_coords=video_coords_inputs,
+                    timestep=timestep_inputs,
 
-                skip_layer_mask=self.transformer.create_skip_layer_mask(batch_size, num_cond, num_cond-1, [19]) if do_spatio_temporal_guidance else None,
-                skip_layer_strategy=SkipLayerStrategy.AttentionValues if do_spatio_temporal_guidance else None,
-                return_dict=True,
-                **extras
-            ).sample)
+                    skip_layer_mask=self.transformer.create_skip_layer_mask(batch_size, num_cond, num_cond-1, [19]) if do_spatio_temporal_guidance else None,
+                    skip_layer_strategy=SkipLayerStrategy.AttentionValues if do_spatio_temporal_guidance else None,
+                    return_dict=True,
+                    **extras
+                ).sample)
+            except Exception as e:
+                from gshub.utils import describe
+                print(f"{describe(hidden_states_inputs)=}")
+                print(f"{describe(encoder_hidden_states_inputs)=}")
+                print(f"{describe(encoder_attention_mask_inputs)=}")
+                print(f"{describe(video_coords_inputs)=}")
+                print(f"{describe(timestep_inputs)=}")
+                print(f"{describe(extras)=}")
+                raise e
+
             noise_pred_chunks = noise_pred.chunk(num_cond)
             if do_classifier_free_guidance:
                 noise_pred_uncond, noise_pred_cond = noise_pred_chunks[:2]
@@ -1239,7 +1269,7 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser()
     parser.add_argument('--rank', type=int, default=0)
-    parser.add_argument('--devices', type=str, nargs='+', default=[0], help='List of devices to use')
+    parser.add_argument('--devices', type=str, nargs='+', default=[], help='List of devices to use')
     args = parser.parse_args()
     devices = [torch.device(f'cuda:{i}') for i in args.devices]
     args.size = len(devices)
@@ -1265,9 +1295,10 @@ if __name__ == "__main__":
     text_encoder = load_text_encoder().to(device) # type: ignore
     captioner = create_captioner(CaptionerType.QWEN_25_VL, device=device)
 
-    for scene in tqdm(sorted(list(Path('../gshub/output/synthesized_dl3dv10k/').iterdir()))[args.rank::len(devices)]):
-        if (scene / '.done').is_file():
-            if (scene / '.caption.done').is_file():
+    for scene in tqdm(sorted(list(Path('../gshub/output/synthesized_dl3dv10k_dense/').iterdir()))[args.rank::len(devices)]):
+        if (scene / 'ground_truth.mp4').is_file():
+            caption_done_flag = scene / '.done.caption'
+            if caption_done_flag.is_file():
                 continue
             try:
                 caption = captioner.caption(scene / 'ground_truth.mp4')
@@ -1279,7 +1310,7 @@ if __name__ == "__main__":
                 torch.save(text_embeds, scene / 'prompt.pt')
                 with open(scene / 'caption.txt', 'w') as f:
                     f.write(caption)
-                (scene / '.caption.done').touch(exist_ok=True)
+                caption_done_flag.touch(exist_ok=True)
             except Exception as e:
                 import traceback
                 traceback.print_exc()

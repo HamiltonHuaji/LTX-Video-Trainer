@@ -389,9 +389,6 @@ class LtxvTrainer:
         # Use strategy to prepare model inputs
         model_inputs = self._training_strategy.prepare_model_inputs(training_batch)
 
-        from gshub.imports import describe
-        print(f"{describe(model_inputs)=}")
-
         # Run transformer forward pass
         model_pred = self._transformer(**model_inputs)[0]
 
@@ -456,6 +453,9 @@ class LtxvTrainer:
         self._text_encoder = components.text_encoder
         self._vae = components.vae
         self._transformer = components.transformer
+        # from ltxv_trainer.custom.base import load_ltxv_xfmr_2b_manually
+        # from ltxv_trainer.custom.inference import LTXVideoTransformer3DModel
+        # self._transformer = load_ltxv_xfmr_2b_manually(LTXVideoTransformer3DModel, torch_dtype=transformer_dtype, latents_add_in_channels=None)
 
         if self._config.acceleration.quantization is not None:
             if self._config.model.training_mode == "full":

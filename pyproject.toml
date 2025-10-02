@@ -33,7 +33,14 @@ dependencies = [
     "typer>=0.15.1",
     "wandb>=0.19.11",
     "einops",
+
+    "dinov3 @ git+https://github.com/HamiltonHuaji/dinov3.git",
+    "gshub @ git+https://github.com/HamiltonHuaji/gshub.git",
+    "python-dotenv",
 ]
+
+[tool.hatch.metadata]
+allow-direct-references = true
 
 [dependency-groups]
 dev = [

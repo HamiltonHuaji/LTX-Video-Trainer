@@ -192,7 +192,7 @@ def example() -> None:
         sys.exit(1)
 
     # Example using both captioner types
-    for captioner_type in [CaptionerType.LLAVA_NEXT_7B, CaptionerType.QWEN_25_VL]:
+    for captioner_type in [CaptionerType.QWEN_25_VL]:
         print(f"\nUsing {captioner_type} captioner:")  # noqa: T201
         model = create_captioner(captioner_type)
         caption = model.caption(sys.argv[1])

@@ -8,7 +8,7 @@ from ltxv_trainer.quantization import QuantizationOptions
 
 
 class ConfigBaseModel(BaseModel):
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="allow")
 
 
 class ModelConfig(ConfigBaseModel):
@@ -94,24 +94,6 @@ class ConditioningConfig(ConfigBaseModel):
     reference_latents_dir: str = Field(
         default="ref_latents",
         description="Directory name for latents of reference videos when using reference_video mode",
-    )
-
-    # for PosedReferenceVideoTrainingStrategy
-    reference_latents_poses_dir: str = Field(
-        default="ref_latents_poses",
-        description="Directory containing reference video poses for posed conditioning",
-    )
-
-    # for PosedReferenceVideoTrainingStrategy
-    cross_reference_latents_dir: str = Field(
-        default="cross_ref_latents",
-        description="Directory containing cross-view reference video latents for posed conditioning",
-    )
-
-    # for PosedReferenceVideoTrainingStrategy
-    cross_reference_latents_poses_dir: str = Field(
-        default="cross_ref_latents_poses",
-        description="Directory containing cross-view reference video poses for posed conditioning",
     )
 
 
@@ -226,7 +208,7 @@ class ValidationConfig(ConfigBaseModel):
         description="Negative prompt to use for validation examples",
     )
 
-    images: list[str] | None = Field(
+    images: list[str | None] | None = Field(
         default=None,
         description="List of image paths to use for validation. "
         "One image path must be provided for each validation prompt",

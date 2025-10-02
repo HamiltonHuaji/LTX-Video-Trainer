@@ -11,7 +11,8 @@ import torch.nn.functional as F
 import torchvision
 import torchvision.transforms.functional
 
-from gshub.utils import describe, not_none, not_none_or_dotenv
+from tqdm.auto import tqdm, trange
+from gshub.utils import describe, not_none, not_none_or_dotenv, read_json, save_json
 
 from einops import *
 from typing import *
@@ -19,6 +20,8 @@ from typing_extensions import *
 from jaxtyping import Float, Shaped, Int, Integer, Bool
 from torch.utils.data import DataLoader, Dataset
 from torchcodec.decoders import VideoDecoder
+from safetensors.torch import load_file, save_file
+from peft import LoraConfig, get_peft_model_state_dict
 import imageio.v3 as iio
 
 from rich.live import Live
@@ -32,10 +35,11 @@ from ltxv_trainer.trainer import LtxvTrainer
 from ltxv_trainer.timestep_samplers import TimestepSampler
 from ltxv_trainer.training_strategies import TrainingStrategy
 from ltxv_trainer.quantization import quantize_model
+from ltxv_trainer.ltxv_pipeline import LTXConditionPipeline
 from ltxv_trainer.model_loader import LtxvModelVersion, load_vae
 from ltxv_trainer.custom.base import CustomDL3DV10KDatasetBatch, CustomDL3DV10KDataset, load_ltxv_xfmr_2b_manually, ltxv_resize_and_crop
 
-from ltxv_trainer.custom.inference import BaseLTXVPipeline, LTXVideoTransformer3DModel, Latents, LatentConditioning, TokenizedLatents, TokenizedLatentMask, TokenizedVideoCoords, latent_indices, patch_indices, indices_to_pixel_coords, patchify, tokenize, encode_as_video, encode_as_images, randn_like
+from ltxv_trainer.custom.inference import BaseLTXVPipeline, LTXVideoTransformer3DModel, Latents, LatentConditioning, TokenizedLatents, TokenizedLatentMask, TokenizedVideoCoords, latent_indices, patch_indices, indices_to_pixel_coords, pixel_to_video_coords, patchify, tokenize, encode_as_video, encode_as_images, randn_like
 
 from diffusers import BitsAndBytesConfig
 from diffusers.models.autoencoders import AutoencoderKLLTXVideo
@@ -149,11 +153,12 @@ class Pi3Config(BaseModel):
                     f'encoder.blocks.{i}.attn.qkv' for i in range(24)
                 ] + [
                     f'encoder.blocks.{i}.attn.proj' for i in range(24)
-                ] + [
-                    f'decoder.{i}.attn.qkv' for i in range(36)
-                ] + [
-                    f'decoder.{i}.attn.proj' for i in range(36)
                 ]
+                # + [
+                #     f'decoder.{i}.attn.qkv' for i in range(36)
+                # ] + [
+                #     f'decoder.{i}.attn.proj' for i in range(36)
+                # ]
             )
             if 'state_dict' in lora_state_dict:
                 # which means the lora_path points to a pytorch lightning full checkpoint
@@ -197,6 +202,8 @@ class CustomTrainerConfig(LtxvTrainerConfig):
 # describe(sigmas)='Tensor([1],torch.float32,cuda:0)'
 
 CustomTrainingBatch = Any
+
+# region: deprecated
 class CustomReferenceVideoTrainingStrategy(TrainingStrategy):
     def pi3_encoder_feature(self, images: Float[torch.Tensor, 'b n c h w']) -> Float[torch.Tensor, 'b n ph pw d']:
         b, n, c, h, w = images.shape # assert c == 3
@@ -838,6 +845,7 @@ class CustomTrainer(LtxvTrainer):
         rel_outputs_path = output_dir.relative_to(self._config.output_dir)
         logger.info(f"🎥 Validation samples for step {self._global_step} saved in {rel_outputs_path}")
         return video_paths
+# endregion
 
 CustomBaseTrainingStrategyContext = TypedDict('CustomBaseTrainingStrategyContext', {
     # model inputs:
@@ -931,7 +939,7 @@ class CustomBaseTrainingStrategy(TrainingStrategy):
         raise NotImplementedError()
 
 
-##### Pi3 probe
+# region: Pi3 probe
 
 class LTXVDataset(Dataset):
     @property
@@ -1160,60 +1168,10 @@ class CustomPi3EncoderProbeVideoTrainingStrategy(CustomBaseTrainingStrategy):
         # print(f"{describe(context)=}")
         return context
 
-    # @torch.no_grad()
-    # def prepare_batch(self, batch: CustomDL3DV10KDatasetBatch, timestep_sampler: TimestepSampler) -> CustomTrainingBatch:
-    #     prompt_embeds = batch["prompt_embeds"] # b s=256 c=4096
-    #     prompt_attention_mask = batch["prompt_attention_mask"] # b s=256
-    #     target_pixels: Float[torch.Tensor, 'b t c h w'] = batch['target_pixels'] # ground truth, 30fps, 25 frames
-    #     context = self.prepare_context(
-    #         target_pixels=target_pixels,
-    #         timestep_sampler=timestep_sampler,
-    #         frame_rate=25,
-    #     )
-    #     return {
-    #         'hidden_states': context['hidden_states'],
-    #         'encoder_hidden_states': prompt_embeds,
-    #         'encoder_attention_mask': prompt_attention_mask,
-    #         'timestep': context['timestep'],
-    #         'video_coords': context['video_coords'],
-    #         'latents_add': context.get('latents_add', None), # b (t h w) 1024/2048
-    #         'model_pred': context['model_pred'], # b (t h w) c
-    #         'condition_mask': context['condition_mask'], # b (t h w) c
-    #         'noise': context['noise'], # b (t h w) c
-    #     }
-    # def prepare_model_inputs(self, batch: CustomTrainingBatch):
-    #     model_inputs = {
-    #         k: v for k, v in batch.items()
-    #         if k in 'hidden_states encoder_hidden_states encoder_attention_mask video_coords timestep latents_add'.split()
-    #     }
-    #     return model_inputs
-    # def compute_loss(self, model_pred: Float[torch.Tensor, 'b n c'], batch: CustomTrainingBatch) -> torch.Tensor:
-    #     """Compute masked loss only on target portion, excluding conditioning tokens."""
-    #     loss = (model_pred - batch['model_pred']).pow(2)
-    #     # Create loss mask: exclude conditioning tokens
-    #     loss_mask = (1 - batch['condition_mask']).float()
-    #     # Apply original loss computation pattern
-    #     loss = loss.mul(loss_mask).div(loss_mask.mean() + 1e-3)
-    #     return loss.mean()
-
 class CustomPi3EncoderProbeTrainer(LtxvTrainer):
     def _prepare_models_for_training(self) -> None:
-        """Prepare models for training with Accelerate."""
-        prepare = self._accelerator.prepare
-        self._vae = prepare(self._vae) # Note: No .to('cpu')
-        self._transformer = prepare(self._transformer)
-        self._text_encoder = prepare(self._text_encoder)
-
-        if not self._config.acceleration.load_text_encoder_in_8bit:
-            self._text_encoder = self._text_encoder.to("cpu")
-
-        # Enable gradient checkpointing if requested
-        if self._config.optimization.enable_gradient_checkpointing:
-            if isinstance(self._transformer, torch.nn.parallel.DistributedDataParallel):
-                # If using DDP, enable gradient checkpointing on the wrapped model
-                self._transformer.module.enable_gradient_checkpointing()
-            else:
-                self._transformer.enable_gradient_checkpointing()
+        super()._prepare_models_for_training()
+        self._vae = self._vae.to(self._accelerator.device)
 
     def _compile_transformer(self) -> None:
         """Compile the transformer model with Torch Inductor."""
@@ -1493,6 +1451,567 @@ class CustomPi3EncoderProbeTrainer(LtxvTrainer):
         logger.info(f"🎥 Validation samples for step {self._global_step} saved in {rel_outputs_path}")
         return video_paths
 
+# endregion
+
+# region: advanced trainer
+
+class CustomDenseDL3DV10KDataset(Dataset):
+    def __init__(
+        self, data_root: str | Path,
+        num_frames: int, num_cond_frames: int, resolution: Tuple[int, int] = (640, 960), *,
+        discrete_reference_indices: bool | float = False, discrete_condition_indices: bool | float = True,
+    ):
+        super().__init__()
+        self.data_root = Path(data_root)
+        assert self.data_root.is_dir(), f"Data root {data_root} is not a directory."
+        try:
+            index = read_json(self.data_root / 'index.json')
+        except:
+            index = {
+                d: read_json(d / 'metrics.json')
+                for d in tqdm(list(self.data_root.iterdir()))
+                if (
+                    (d / 'metrics.json').is_file() and
+                    (d / '.done.gen_dense').is_file() and
+                    (d / '.done.gen_sparse.v3').is_file() and
+                    (d / 'prompt.pt').is_file()
+                )
+            }
+            index = {
+                str(d.relative_to(self.data_root)): {
+                    'psnr': v['psnr'],
+                    'ssim': v['ssim'],
+                    'lpips': v['lpips'],
+                }
+                for d, v in index.items()
+                if v.get('psnr', 0) > 29.0
+            }
+            save_json(index, self.data_root / 'index.json')
+
+        # self.items = [d for d in self.data_root.iterdir() if (d / '.done.dense').exists()]
+        # self.items = [d for d in self.items if (d / 'prompt.pt').is_file()]
+        self.items = [self.data_root / k for k in index.keys()]
+
+        self.num_frames = num_frames
+        self.num_cond_frames = num_cond_frames
+        self.resolution = resolution
+
+        self._discrete_reference_indices = discrete_reference_indices
+        self._discrete_condition_indices = discrete_condition_indices
+
+        if (self.data_root / 'default_prompt.pt').exists():
+            self.default_prompt = torch.load(self.data_root / 'default_prompt.pt')
+        else:
+            self.default_prompt = None
+
+    def __len__(self):
+        return len(self.items)
+
+    @property
+    def discrete_reference_indices(self):
+        if isinstance(self._discrete_reference_indices, float):
+            return random.random() < self._discrete_reference_indices
+        return self._discrete_reference_indices
+
+    @property
+    def discrete_condition_indices(self):
+        if isinstance(self._discrete_condition_indices, float):
+            return random.random() < self._discrete_condition_indices
+        return self._discrete_condition_indices
+
+    def random_slice(self, length: int, total_length: int):
+        slice_start = random.randint(0, total_length - length * 2)
+        slice_stop = slice_start + self.num_frames * 2
+        return slice(slice_start, slice_stop, 2)
+
+    def random_indices(self, length: int, total_length: int) -> List[int]:
+        return torch.randperm(total_length)[:length].tolist()
+
+    def __getitem__(self, index: int):
+        item_dir = self.items[index % len(self)]
+        # camera_params = torch.load(item_dir / 'camera_params.pth')
+        # extrinsics: Float[torch.Tensor, 'n 4 4'] = camera_params['extrinsics'] # n 4 4, c2w
+        # intrinsics: Float[torch.Tensor, 'n 3 3'] = camera_params['intrinsics'] # n 3 3
+        # total_frames = intrinsics.size(0)
+
+        ground_truth_decoder = VideoDecoder(item_dir / 'dense_pixels.mp4')
+        ref_pixels_decoder = VideoDecoder(item_dir / 'sparse_pixels.mp4')
+        # ref_depths_decoder = VideoDecoder(item_dir / 'render_depths.mp4')
+        total_frames = min(not_none(ground_truth_decoder.metadata.num_frames), not_none(ref_pixels_decoder.metadata.num_frames))
+
+        if total_frames < self.num_frames * 2:
+            print(f"Error: too few frames ({total_frames}) in {item_dir}.")
+            self.items.pop(index)
+            return self[index % len(self)]
+
+        if self.discrete_reference_indices:
+            ref_selection = self.random_indices(self.num_cond_frames, total_frames)
+            reference_pixels = ref_pixels_decoder.get_frames_at(indices=ref_selection).data
+            # reference_depths = ref_depths_decoder.get_frames_at(indices=ref_selection).data
+            target_pixels = ground_truth_decoder.get_frames_at(indices=ref_selection).data
+        else:
+            ref_selection = self.random_slice(self.num_frames, total_frames)
+            reference_pixels = ref_pixels_decoder[ref_selection]
+            # reference_depths = ref_depths_decoder[ref_selection]
+            target_pixels = ground_truth_decoder[ref_selection]
+        # reference_extrinsics = extrinsics[ref_selection]
+        # reference_intrinsics = intrinsics[ref_selection]
+
+        if self.discrete_condition_indices:
+            cond_selection = self.random_indices(self.num_cond_frames, total_frames)
+            condition_pixels = ground_truth_decoder.get_frames_at(indices=cond_selection).data
+        else:
+            cond_selection = self.random_slice(self.num_cond_frames, total_frames)
+            condition_pixels = ground_truth_decoder[cond_selection]
+        # condition_extrinsics = extrinsics[cond_selection]
+        # condition_intrinsics = intrinsics[cond_selection]
+
+        if (item_dir / 'prompt.pt').is_file():
+            prompt = torch.load(item_dir / 'prompt.pt')
+        else:
+            assert self.default_prompt is not None, "Default prompt not found in data root."
+            prompt = self.default_prompt
+
+        return {
+            'fps': ground_truth_decoder.metadata.average_fps or 30,
+            'prompt_embeds': prompt['prompt_embeds'],
+            'prompt_attention_mask': prompt['prompt_attention_mask'],
+            'target_pixels': F.interpolate(target_pixels.float() / 255, size=self.resolution, mode='bilinear', align_corners=False), # t c h w
+
+            'reference_pixels': F.interpolate(reference_pixels.float() / 255, size=self.resolution, mode='bilinear', align_corners=False), # t c h w
+            # 'reference_depths': F.interpolate(reference_depths.float() / 255, size=self.resolution, mode='bilinear', align_corners=False), # t c h w
+            # 'reference_extrinsics': reference_extrinsics, # t 4 4
+            # 'reference_intrinsics': reference_intrinsics, # t 3 3
+
+            'condition_pixels': F.interpolate(condition_pixels.float() / 255, size=self.resolution, mode='bilinear', align_corners=False), # r c h w
+            # 'condition_extrinsics': condition_extrinsics, # r 4 4
+            # 'condition_intrinsics': condition_intrinsics, # r 3 3
+        }
+
+class AdvancedModelConfig(ModelConfig):
+    transformer_extras: Dict[str, Any] = Field(default_factory=dict)
+
+class AdvancedTrainerConfig(LtxvTrainerConfig):
+    model: AdvancedModelConfig = Field(default_factory=AdvancedModelConfig)
+    validation: CustomValidationConfig = Field(default_factory=CustomValidationConfig)
+
+    dinov3: DINOv3Config = Field(default_factory=DINOv3Config)
+    pi3: Pi3Config = Field(default_factory=Pi3Config)
+
+    @model_validator(mode="after")
+    def validate_conditioning_compatibility(self) -> Self:
+        return self
+
+class AdvancedVideoTrainingStrategy(CustomBaseTrainingStrategy):
+    def pi3_encoder_feature(self, images: Float[torch.Tensor, 'b n c h w']) -> Float[torch.Tensor, 'b n ph pw d']:
+        b, n, c, h, w = images.shape # assert c == 3
+        images = (images - self._pi3.image_mean) / self._pi3.image_std # type: ignore
+
+        patch_h, patch_w = h // 14, w // 14
+        hidden = self._pi3.encoder(rearrange(images, 'b n c h w -> (b n) c h w'), is_training=True)
+        if isinstance(hidden, dict):
+            hidden = hidden['x_norm_patchtokens']
+        return hidden.view(b, n, patch_h, patch_w, -1)
+
+    def pi3_decoder_feature(self, encoder_feat: Float[torch.Tensor, 'b n ph pw d']) -> Float[torch.Tensor, 'b n ph pw e']:
+        b, n, ph, pw, d = encoder_feat.shape
+        h, w = ph * 14, pw * 14
+        hidden, pos = self._pi3.decode(rearrange(encoder_feat, 'b n ph pw d -> (b n) (ph pw) d'), n, h, w)
+        return hidden[:, self._pi3.patch_start_idx:].view(b, n, ph, pw, -1) # remove register tokens
+
+    @torch.compile
+    @torch.no_grad()
+    def pi3_feature(self, images: Float[torch.Tensor, 'b n c h w']) -> Float[torch.Tensor, 'b n ph pw 3*d']:
+        encoder_feat = self.pi3_encoder_feature(images)
+        decoder_feat = self.pi3_decoder_feature(encoder_feat)
+        # return encoder_feat, decoder_feat
+        # return torch.cat([encoder_feat, decoder_feat], dim=-1)
+        return decoder_feat
+
+    def __init__(self, conditioning_config: ConditioningConfig, vae: AutoencoderKLLTXVideo, pi3: Any):
+        super().__init__(conditioning_config)
+        self._vae = vae
+
+        from pi3.models.pi3 import Pi3
+        self._pi3 = cast(Pi3, pi3)
+        self._pi3_transform = Pi3Config.transform()
+
+        self.override_frame_rate = 10
+
+    def prepare_context(
+        self,
+        target_pixels: Optional[Float[torch.Tensor, 'b t c h w']] = None,
+        first_frame_pixels: Optional[Float[torch.Tensor, 'b f c h w']] = None,
+        reference_pixels: Optional[Float[torch.Tensor, 'b r c h w']] = None,
+        condition_pixels: Optional[Float[torch.Tensor, 'b n c h w']] = None,
+        video_dims: Tuple[int, int, int] = (960, 640, 25), # width, height, frames
+        generator: Optional[torch.Generator] = None,
+        timestep_sampler: Optional[TimestepSampler] = None,
+        frame_rate: float = 25,
+
+        # _is_low_fps = True # 假设 reference, target 是从高帧率视频中降采样的视频, 应当插帧; 对于推理, 应当向 reference 中插帧;
+        _is_low_fps = False, # 假设 reference, target 是全帧率视频, 输出视频应当与之一一对应; 对于训练, 应当从 reference 中抽帧;
+        # _is_low_fps = None, # 从 timestep_sampler 中推断
+
+        **unused_kwargs,
+    ):
+        t_compress, s_compress = self._vae.temporal_compression_ratio, self._vae.spatial_compression_ratio
+
+        _is_low_fps = False # override this for debugging
+        if _is_low_fps is None:
+            _is_low_fps = (timestep_sampler is None) # 推理时 reference 是低帧率视频; 训练时 reference 是全帧率视频
+        
+        assert reference_pixels is not None, "reference_pixels must be provided"
+        assert condition_pixels is not None, "condition_pixels must be provided"
+
+        # sizes and dims
+        if target_pixels is not None:
+            b, t, c, h, w = target_pixels.shape
+        else:
+            width, height, frames = video_dims
+            b, t, c, h, w = 1, frames, 3, height, width
+        latent_frames = (t - 1) // t_compress + 1
+        latent_height = h // s_compress
+        latent_width = w // s_compress
+
+        if (target_pixels is not None) and (timestep_sampler is not None):
+            target_latents = encode_as_video(self._vae, target_pixels) # b c latent_frames latent_height latent_width
+            target_condition_mask = torch.zeros((b, 128, latent_frames, latent_height, latent_width), device=target_latents.device, dtype=target_latents.dtype)
+        else:
+            target_latents = torch.randn((b, 128, latent_frames, latent_height, latent_width), device=self._vae.device, dtype=self._vae.dtype, generator=generator)
+            target_condition_mask = torch.zeros((b, 128, latent_frames, latent_height, latent_width), device=target_latents.device, dtype=target_latents.dtype)
+        target_video_coords = pixel_to_video_coords(indices_to_pixel_coords(patch_indices(patchify(target_latents))))
+        target_video_coords[:, 0] = target_video_coords[:, 0] / frame_rate
+
+        condition_latents = encode_as_images(self._vae, condition_pixels)
+        condition_video_coords = pixel_to_video_coords(indices_to_pixel_coords(patch_indices(patchify(condition_latents)), frame_offset=random.randint(-int(20*frame_rate), -int(10*frame_rate))))
+        condition_video_coords[:, 0] = condition_video_coords[:, 0] / frame_rate
+        condition_sigmas = torch.zeros_like(condition_latents)
+        # if _is_low_fps:
+        #     low_fps_reference_pixels = reference_pixels
+        # else:
+        #     low_fps_reference_pixels = reference_pixels[:, [i for i in range(0, reference_pixels.size(1), t_compress)]]
+        # reference_latents = encode_as_images(self._vae, low_fps_reference_pixels)
+        reference_latents = encode_as_video(self._vae, reference_pixels)
+        reference_video_coords = target_video_coords
+        reference_sigmas = torch.zeros_like(reference_latents)
+
+        # with torch.no_grad():
+        #     pi3_input_images = self._pi3_transform(torch.cat([
+        #         condition_pixels, low_fps_reference_pixels
+        #     ], dim=1))
+        # if target_pixels is not None:
+        #     with torch.no_grad():
+        #         pi3_input_images = self._pi3_transform(target_pixels[:, [max(i-t_compress+1, 0) for i in range(0, t+t_compress-1, t_compress)]]) # b latent_frames c h w
+        #         pi3_input_images = F.interpolate(rearrange(pi3_input_images, 'b t c h w -> (b t) c h w'), size=(latent_height*14, latent_width*14), mode='bicubic', align_corners=False, antialias=True)
+        #         encoder_feature, decoder_feature = self.pi3_feature(rearrange(pi3_input_images.to(self._vae.dtype), '(b t) c h w -> b t c h w', b=b)) # b latent_frames latent_height latent_width c
+        #         latents_add = rearrange(decoder_feature, 'b t h w d -> b (t h w) d')
+        # else:
+        #     latents_add = None
+
+        if timestep_sampler is not None:
+            assert target_pixels is not None
+            # train; target pixels provided; add noise to target latents; may do first frame conditioning; set target_condition_mask[:, :, 0] = 1 if randomly selected
+            target_condition_mask[:, :, 0] = (torch.rand((b, 1, 1, 1), device=target_latents.device, generator=generator) < self.conditioning_config.first_frame_conditioning_p).to(target_latents)
+
+            noise = randn_like(target_latents, generator=generator)
+            sigmas: Float[torch.Tensor, 'b'] = timestep_sampler.sample_for(tokenize(patchify(target_latents)))
+            applied_sigmas = torch.min(1 - target_condition_mask, rearrange(sigmas, 'b -> b 1 1 1 1')).to(target_latents) # b 128 f+r+t h w
+            target_hidden_states = torch.lerp(target_latents, noise, applied_sigmas) # as input:hidden_states, (batch_size num_tokens, 128)
+
+            model_pred = noise - target_latents # as prediction target, (batch_size num_tokens, 128)
+            condition_mask = target_condition_mask
+        else:
+            # inference; target pixels not provided; no additional noise; may do first frame conditioning; set target_condition_mask[:, :, 0] = 1 if first_frame_pixels is provided
+            if first_frame_pixels is not None:
+                first_frame_latents = encode_as_video(self._vae, first_frame_pixels)
+                target_latents[:, :, 0:first_frame_latents.size(2), :, :] = first_frame_latents
+                target_condition_mask[:, :, 0:first_frame_latents.size(2), :, :] = 1 # b c latent_frames latent_height latent_width
+            applied_sigmas = 1 - target_condition_mask # b 128 f+r+t h w
+
+            target_hidden_states = target_latents # as input:hidden_states
+            model_pred = None # as prediction target
+            condition_mask = target_condition_mask
+
+        # assemble context
+        hidden_states = torch.cat([condition_latents, reference_latents, target_hidden_states], dim=2) # b c latent_frames+r h w
+        video_coords = torch.cat([condition_video_coords, reference_video_coords, target_video_coords], dim=-1) # b c latent_frames*latent_height*latent_width*2
+        applied_sigmas = torch.cat([condition_sigmas, reference_sigmas, applied_sigmas], dim=2)
+        condition_mask = torch.cat([1 - condition_sigmas, 1 - reference_sigmas, condition_mask], dim=2)
+        if model_pred is not None:
+            model_pred = torch.cat([torch.zeros_like(condition_latents), torch.zeros_like(reference_latents), model_pred], dim=2)
+
+        with torch.no_grad():
+            # pi3_input_images = self._pi3_transform(torch.cat([condition_pixels, reference_pixels[:, [max(i-t_compress+1, 0) for i in range(0, t+t_compress-1, t_compress)]]], dim=1))
+            # pi3_input_images = F.interpolate(rearrange(pi3_input_images, 'b t c h w -> (b t) c h w'), size=(latent_height*14, latent_width*14), mode='bicubic', align_corners=False, antialias=True)
+            # feature = self.pi3_feature(rearrange(pi3_input_images.to(self._vae.dtype), '(b t) c h w -> b t c h w', b=b)) # b (r+t) latent_height latent_width c
+            # condition_feature = feature[:, 0:condition_latents.size(2)]
+            # reference_feature = feature[:, condition_latents.size(2):condition_latents.size(2)+reference_latents.size(2)]
+            # latents_add = rearrange(torch.cat([
+            #     condition_feature, reference_feature, reference_feature
+            # ], dim=1), 'b t h w d -> b (t h w) d')
+            latents_add = None
+
+        context = {
+            'hidden_states': tokenize(patchify(hidden_states)),
+            'timestep': tokenize(patchify(applied_sigmas)).mean(-1) * 1000,
+            'video_coords': video_coords,
+            'latents_add': latents_add,
+
+            'condition_mask': tokenize(patchify(condition_mask)),
+            'model_pred': tokenize(patchify(model_pred)), # not the input to the model, but the training target
+            # 'noise': tokenize(patchify(noise)),
+        }
+        return context
+
+class AdvancedTrainer(LtxvTrainer):
+    _config: AdvancedTrainerConfig
+
+    def _prepare_models_for_training(self) -> None:
+        super()._prepare_models_for_training()
+        self._vae = self._vae.to(self._accelerator.device)
+
+    def _load_models(self) -> None:
+        """Load the LTXV model components."""
+        # Load all model components using the new loader
+        transformer_dtype = torch.bfloat16 if self._config.model.training_mode == "lora" else torch.float32
+        # Prepare components with accelerator
+        self._scheduler = load_scheduler()
+        self._tokenizer = load_tokenizer()
+        self._text_encoder = load_text_encoder()
+        self._vae = load_vae(self._config.model.model_source, dtype=torch.bfloat16)
+        self._transformer = load_ltxv_xfmr_2b_manually(LTXVideoTransformer3DModel, torch_dtype=transformer_dtype, **self._config.model.transformer_extras)
+        if self._config.acceleration.quantization is not None:
+            if self._config.model.training_mode == "full":
+                raise ValueError("Quantization is not supported in full training mode.")
+            logger.warning(f"Quantizing model with precision: {self._config.acceleration.quantization}")
+            self._transformer = quantize_model(self._transformer, precision=self._config.acceleration.quantization)
+
+        self._pi3 = self._config.pi3.model().to(torch.bfloat16).eval()
+        self._pi3.requires_grad_(False)
+        self._pi3.to(self._accelerator.device)
+
+        # Freeze all models. We later unfreeze the transformer based on training mode.
+        self._text_encoder.requires_grad_(False)
+        self._vae.requires_grad_(False)
+        self._transformer.requires_grad_(False)
+
+    def _save_checkpoint(self) -> Path:
+        """Save the model weights."""
+        if self._config.model.training_mode == "full":
+            return super()._save_checkpoint()
+        elif self._config.model.training_mode == "lora":
+            saved_weights_path = super()._save_checkpoint()
+            lora_state_dict = load_file(saved_weights_path, device="cpu")
+
+            # insert extra modules' state dict of self._transformer
+            lora_state_dict.update({
+                k: v.cpu()
+                for k, v in self._transformer.state_dict().items()
+                if any(k.startswith(prefix) for prefix in getattr(self._transformer, 'extra_modules', set()))
+            })
+
+            # write back
+            save_file(lora_state_dict, saved_weights_path)
+            return saved_weights_path
+        else:
+            raise ValueError(f"Unknown training mode: {self._config.model.training_mode}")
+
+    def _collect_trainable_params(self) -> None:
+        """Collect trainable parameters based on training mode."""
+        if self._config.model.training_mode == "lora":
+            # For LoRA training, first set up LoRA layers
+            self._setup_lora()
+        elif self._config.model.training_mode == "full":
+            # For full training, unfreeze all transformer parameters
+            self._transformer.requires_grad_(True)
+        else:
+            raise ValueError(f"Unknown training mode: {self._config.model.training_mode}")
+
+        # if self._transformer.latents_add_proj_in is not None:
+        #     self._transformer.latents_add_proj_in.requires_grad_(True)
+        for prefix in getattr(self._transformer, 'extra_modules', set()):
+            module = getattr(self._transformer, prefix, None)
+            if module is not None:
+                module.requires_grad_(True)
+
+        self._trainable_params = [p for p in self._transformer.parameters() if p.requires_grad]
+        logger.debug(f"Trainable params count: {sum(p.numel() for p in self._trainable_params):,}")
+
+    def __init__(self, trainer_config: AdvancedTrainerConfig, training_strategy_cls = AdvancedVideoTrainingStrategy) -> None:
+        self._config = trainer_config
+        self._print_config(trainer_config)
+        self._setup_accelerator()
+        self._load_models()
+        self._compile_transformer()
+        self._collect_trainable_params()
+        self._load_checkpoint()
+        self._prepare_models_for_training()
+        self._dataset = None
+        self._global_step = -1
+        self._checkpoint_paths = []
+        self._init_wandb()
+        self._training_strategy = training_strategy_cls(self._config.conditioning, self._vae, self._pi3)
+
+    def _init_dataloader(self) -> None:
+        """Initialize the training data loader using the strategy's data sources."""
+        if self._dataset is None:
+            width, height, frames = self._config.validation.video_dims
+            # self._dataset = CustomDL3DV10KDataset(
+            #     # self._config.data.preprocessed_data_root, num_frames=25, num_cond_frames=8, resolution=(640, 960),
+            #     self._config.data.preprocessed_data_root, num_frames=frames, num_cond_frames=8, resolution=(height, width),
+            #     discrete_reference_indices=False, discrete_condition_indices=True,
+            # )
+            # self._dataset = LTXVDataset(
+            #     self._config.data.preprocessed_data_root, num_frames=frames, num_cond_frames=8, resolution=(height, width),
+            #     discrete_reference_indices=False, discrete_condition_indices=True,
+            # )
+            self._dataset = CustomDenseDL3DV10KDataset(
+                self._config.data.preprocessed_data_root, num_frames=frames, num_cond_frames=8, resolution=(height, width),
+                discrete_reference_indices=False, discrete_condition_indices=True,
+            )
+            logger.debug(f"Loaded dataset with {len(self._dataset):,} samples from {self._dataset}")
+        dataloader = DataLoader(
+            self._dataset,
+            batch_size=self._config.optimization.batch_size,
+            shuffle=True,
+            drop_last=True,
+            num_workers=self._config.data.num_dataloader_workers,
+            pin_memory=self._config.data.num_dataloader_workers > 0,
+        )
+        self._dataloader = self._accelerator.prepare(dataloader)
+
+    @torch.no_grad()
+    @torch.compiler.set_stance("force_eager")
+    def _sample_videos(self, progress: Progress) -> Optional[list[Path]]:
+        """Run validation by generating images from validation prompts."""
+        if hasattr(self, 'config_path'): # reload config
+            config_path = getattr(self, 'config_path')
+            import yaml
+            with open(config_path, "r") as file:
+                config_data = yaml.safe_load(file)
+            self._config.validation = self._config.__class__(**config_data).validation
+
+        self._vae.to(self._accelerator.device)
+        # Model is already in the correct device if loaded in 8-bit.
+        if not self._config.acceleration.load_text_encoder_in_8bit:
+            self._text_encoder.to(self._accelerator.device)
+
+        pipeline = BaseLTXVPipeline(
+            scheduler=copy.deepcopy(self._scheduler),
+            vae=self._accelerator.unwrap_model(self._vae), # type: ignore
+            text_encoder=self._accelerator.unwrap_model(self._text_encoder), # type: ignore
+            tokenizer=self._tokenizer,
+            transformer=self._accelerator.unwrap_model(self._transformer), # type: ignore
+        )
+        pipeline.set_progress_bar_config(disable=True)
+
+        # Create a task in the sampling progress
+        task = progress.add_task("sampling", total=len(self._config.validation.samples))
+
+        output_dir = Path(self._config.output_dir) / "samples"
+        output_dir.mkdir(exist_ok=True, parents=True)
+
+        i = 0
+        video_paths = []
+        for j, sample in enumerate(self._config.validation.samples):
+            generator = torch.Generator(device=self._accelerator.device).manual_seed(self._config.validation.seed)
+
+            width, height, frames = self._config.validation.video_dims
+            prompts = [not_none(sample.prompt or self._config.validation.default_prompt)]
+            negative_prompts = [not_none(sample.negative_prompt or self._config.validation.negative_prompt)]
+
+            prompt_embeds = pipeline.encode_prompts(prompts)
+            negative_prompts = pipeline.encode_prompts(negative_prompts)
+
+            batch_size = 1
+            latent_channels = 128
+            latent_frames = (frames - 1) // 8 + 1
+            latent_height = height //32
+            latent_width = width // 32
+            with self._accelerator.device: # type: ignore
+                context_kwargs = {
+                    'video_dims': self._config.validation.video_dims,
+                    'generator': generator,
+                    'timestep_sampler': None,
+                    'frame_rate': self._training_strategy._override_frame_rate or self._training_strategy._default_frame_rate,
+                }
+
+                if sample.first_frame is not None:
+                    if isinstance(sample.first_frame, str):
+                        first_frames = torch.as_tensor(iio.imread(sample.first_frame)).to(self._accelerator.device).float()[None].permute(0,3,1,2) / 255
+                    else:
+                        video_decoder = VideoDecoder(sample.first_frame.path, dimension_order='NCHW')
+                        first_frames = video_decoder[sample.first_frame.index:sample.first_frame.index+1].to(self._accelerator.device).float() / 255
+                    first_frames = F.interpolate(first_frames[0:1], size=(height, width), mode='bicubic', align_corners=False, antialias=True).to(self._vae.dtype) # t c h w
+                    context_kwargs['first_frame_pixels'] = first_frames[None]
+
+                if sample.target_video is not None:
+                    target_video_path = sample.target_video if isinstance(sample.target_video, str) else sample.target_video.path
+                    target_video_slice = slice(None, None, None) if isinstance(sample.target_video, str) else slice(sample.target_video.start, sample.target_video.end, sample.target_video.step)
+
+                    target_video_decoder = VideoDecoder(target_video_path, dimension_order='NCHW')
+                    target_pixels = target_video_decoder[target_video_slice][0:frames].to(self._accelerator.device).float() / 255
+                    target_pixels = F.interpolate(target_pixels, size=(height, width), mode='bicubic', align_corners=False, antialias=True).to(self._vae.dtype) # t c h w
+                    context_kwargs['target_pixels'] = target_pixels[None]
+                
+                if sample.reference_video is not None:
+                    reference_video_path = sample.reference_video if isinstance(sample.reference_video, str) else sample.reference_video.path
+                    reference_video_slice = slice(None, None, None) if isinstance(sample.reference_video, str) else slice(sample.reference_video.start, sample.reference_video.end, sample.reference_video.step)
+
+                    reference_video_decoder = VideoDecoder(reference_video_path, dimension_order='NCHW')
+                    reference_pixels = reference_video_decoder[reference_video_slice][0:frames].to(self._accelerator.device).float() / 255
+                    reference_pixels = F.interpolate(reference_pixels, size=(height, width), mode='bicubic', align_corners=False, antialias=True).to(self._vae.dtype)
+                    context_kwargs['reference_pixels'] = reference_pixels[None]
+
+                if sample.condition_video is not None:
+                    condition_video_path = sample.condition_video if isinstance(sample.condition_video, str) else sample.condition_video.path
+                    condition_video_decoder = VideoDecoder(condition_video_path, dimension_order='NCHW')
+
+                    if isinstance(sample.condition_video, str):
+                        condition_pixels = condition_video_decoder[0+frames:32+frames:4].to(self._accelerator.device).float() / 255
+                    else:
+                        condition_video_slice = slice(sample.condition_video.start, sample.condition_video.end, sample.condition_video.step)
+                        condition_pixels = condition_video_decoder[condition_video_slice][0:8].to(self._accelerator.device).float() / 255
+                    condition_pixels = F.interpolate(condition_pixels, size=(height, width), mode='bicubic', align_corners=False, antialias=True).to(self._vae.dtype)
+                    context_kwargs['condition_pixels'] = condition_pixels[None]
+
+                context = self._training_strategy.prepare_context(**context_kwargs)
+                context = {k: (v.to(cast(torch.dtype, self._transformer.dtype)) if isinstance(v, torch.Tensor) else v) for k, v in context.items()}
+
+            with torch.amp.autocast(self._accelerator.device.type, dtype=torch.bfloat16):
+                latents = pipeline.latents_sample_loop(
+                    latents=context['hidden_states'],
+                    latent_coords=context['video_coords'],
+                    prompt_embeds=prompt_embeds['prompt_embeds'],
+                    prompt_attention_mask=prompt_embeds['prompt_attention_mask'],
+                    negative_prompt_embeds=negative_prompts['prompt_embeds'],
+                    negative_prompt_attention_mask=negative_prompts['prompt_attention_mask'],
+                    num_inference_steps=self._config.validation.inference_steps,
+                    conditioning=(context['hidden_states'], context['condition_mask']) if 'condition_mask' in context else None,
+                    latents_add=context.get('latents_add', None),
+                )
+                latents = rearrange(latents[:, -latent_frames*latent_height*latent_width:, :], 'b (fp hp wp) (c pf ph pw) -> b c (fp pf) (hp ph) (wp pw)', fp=latent_frames, hp=latent_height, wp=latent_width, pf=1, ph=1, pw=1)
+                videos = pipeline.sample_videos(latents, device=self._accelerator.device)
+            for video in videos:
+                video_path = output_dir / f"step_{self._global_step:06d}_{i}.mp4"
+                torchvision.io.write_video(str(video_path), video.permute(1,2,3,0).clamp(0,1).cpu()*255, fps=24, options={'crf': '20'})
+                video_paths.append(video_path)
+                i += 1
+            progress.update(task, advance=1)
+
+        progress.remove_task(task)
+
+        # Move unused components back to CPU.
+        # self._vae.to("cpu")
+        if not self._config.acceleration.load_text_encoder_in_8bit:
+            self._text_encoder.to("cpu")
+
+        rel_outputs_path = output_dir.relative_to(self._config.output_dir)
+        logger.info(f"🎥 Validation samples for step {self._global_step} saved in {rel_outputs_path}")
+        return video_paths
+
+# endregion
 
 if __name__ == "__main__":
 
@@ -1521,17 +2040,22 @@ if __name__ == "__main__":
 
         # Convert the loaded data to the LtxvTrainerConfig object
         try:
-            trainer_config = CustomTrainerConfig(**config_data)
+            trainer_config = AdvancedTrainerConfig(**config_data)
         except Exception as e:
             typer.echo(f"Error: Invalid configuration data: {e}")
             raise typer.Exit(code=1) from e
+        
+        import shutil
+        Path(trainer_config.output_dir).mkdir(parents=True, exist_ok=True)
+        shutil.copy(__file__, Path(trainer_config.output_dir) / 'trainer.py')
 
         # Initialize the training process
         # trainer = CustomTrainer(trainer_config)
-        trainer = CustomPi3EncoderProbeTrainer(trainer_config)
+        # trainer = CustomPi3EncoderProbeTrainer(trainer_config)
+        trainer = AdvancedTrainer(trainer_config)
         setattr(trainer, 'config_path', config_path)
-        print(f"{trainer._scheduler.sigmas=}")
-        print(f"{trainer._scheduler.config.get('stochastic_sampling', None)}")
+        # print(f"{trainer._scheduler.sigmas=}") # 1->0单调减少
+        # print(f"{trainer._scheduler.config.get('stochastic_sampling', None)}") # False
 
         # sample_progress = Progress(
         #     TextColumn("Sampling validation videos"),

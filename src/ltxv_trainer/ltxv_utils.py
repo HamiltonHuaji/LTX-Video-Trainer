@@ -4,6 +4,8 @@ from torch import Tensor
 from transformers import T5EncoderModel, T5Tokenizer
 
 from einops import rearrange
+from typing import TypedDict
+from jaxtyping import Float, Shaped, Int, Integer, Bool
 
 def encode_prompt(
     tokenizer: T5Tokenizer,
@@ -65,6 +67,11 @@ def pack_latents(
     latents = rearrange(latents, 'b c (f pf) (h ph) (w pw) -> b (f h w) (c pf ph pw)', pf=temporal_patch_size, ph=spatial_patch_size, pw=spatial_patch_size)
     return latents
 
+class VideoEncoding(TypedDict):
+    num_frames: int
+    height: int
+    width: int
+    latents: Float[torch.Tensor, 'b l c']
 
 def encode_video(
     vae: AutoencoderKLLTXVideo,
@@ -74,12 +81,12 @@ def encode_video(
     device: torch.device | None = None,
     dtype: torch.dtype | None = None,
     generator: torch.Generator | None = None,
-) -> dict[str, Tensor | int]:
+) -> VideoEncoding:
     """Encodes input images/videos into latent representations.
 
     Args:
         vae: VAE model for encoding
-        image_or_video: Input tensor of shape [B,C,F,H,W] or [B,C,1,H,W] # Wrong docstring ??????
+        image_or_video: Input tensor of shape [B,F,C,H,W] or [B,C,1,H,W] # Wrong docstring ??????
         patch_size: Spatial patch size
         patch_size_t: Temporal patch size
         device: Target device for tensors
@@ -233,7 +240,7 @@ def prepare_video_coordinates(
         device: Target device for tensors
 
     Returns:
-        Video coordinates tensor of shape [batch_size, 3, sequence_length * sequence_multiplier]
+        Video coordinates tensor of shape [batch_size, sequence_length * sequence_multiplier, 3]
     """
     if device is None:
         device = torch.device("cpu")

@@ -52,7 +52,7 @@ class TrainingBatch(BaseModel):
     fps: float  # Frames per second
 
     # Model input parameters
-    rope_interpolation_scale: list[float]  # Scaling factors for positional embeddings
+    rope_interpolation_scale: list[float] | None = None  # Scaling factors for positional embeddings
     video_coords: Tensor | None = None  # Optional explicit video coordinates
 
     @computed_field
@@ -254,9 +254,21 @@ class StandardTrainingStrategy(TrainingStrategy):
         # Create timesteps based on conditioning mask
         sampled_timestep_values = torch.round(sigmas.squeeze(-1).squeeze(-1) * 1000.0).long()
         timesteps = self._create_timesteps_from_conditioning_mask(conditioning_mask, sampled_timestep_values)
+        print(timesteps.reshape(target_latents.shape[0], latent_frames, latent_height, latent_width).float().mean(dim=(2, 3)))
 
         # Use existing utility function for ROPE scale factors
         rope_interpolation_scale_factors = get_rope_scale_factors(fps)
+        video_coords = None
+
+        from einops import rearrange
+        video_coords = torch.meshgrid(torch.arange(latent_frames), torch.arange(latent_height), torch.arange(latent_width), indexing='ij')
+        video_coords = torch.stack(video_coords, dim=-1)
+        video_coords = video_coords.unsqueeze(0).repeat(target_latents.shape[0], 1, 1, 1, 1) # Integer[torch.Tensor, 'b f h w c=3']
+        video_coords = rearrange(video_coords, 'b f h w c -> b c (f h w)').to(targets) # Integer[torch.Tensor, 'b c fhw']
+        video_coords[:, 0] *= rope_interpolation_scale_factors[0]
+        video_coords[:, 1] *= rope_interpolation_scale_factors[1]
+        video_coords[:, 2] *= rope_interpolation_scale_factors[2]
+        rope_interpolation_scale_factors = None
 
         return TrainingBatch(
             latents=noisy_latents,
@@ -271,7 +283,7 @@ class StandardTrainingStrategy(TrainingStrategy):
             width=latent_width,
             fps=fps,
             rope_interpolation_scale=rope_interpolation_scale_factors,
-            video_coords=None,
+            video_coords=video_coords,
         )
 
     def compute_loss(self, model_pred: Tensor, batch: TrainingBatch) -> Tensor:
@@ -439,170 +451,6 @@ class ReferenceVideoTrainingStrategy(TrainingStrategy):
         return loss.mean()
 
 
-class PosedReferenceVideoTrainingStrategy(TrainingStrategy):
-    """Posed reference video training strategy for IC-LoRA.
-    temporal concat: cross-reference video (content control) + reference video (view control) + noisy latents
-
-    This strategy implements training with reference video conditioning where:
-    - Reference latents (clean) are concatenated with target latents (noised)
-    - Video coordinates are doubled to handle concatenated sequence
-    - Loss is computed only on the target portion (masked loss)
-    - Supports first frame conditioning on the target sequence
-    - Uses PRoPE for positional embeddings
-    """
-
-    def __init__(self, conditioning_config: ConditioningConfig, with_cross_view_reference: bool = False):
-        """Initialize with configurable reference latents directory.
-
-        Args:
-            conditioning_config: Configuration for conditioning behavior
-        """
-        super().__init__(conditioning_config)
-        self.with_cross_view_reference = with_cross_view_reference
-        assert not self.with_cross_view_reference, f"Cross-view reference is not supported yet in {self.__class__.__name__}"
-
-    def get_data_sources(self) -> dict[str, str]:
-        """IC-LoRA training requires latents, conditions, and reference latents."""
-        data_sources = {
-            "latents": "latents",
-            "conditions": "conditions",
-            self.conditioning_config.reference_latents_dir: "ref_latents",
-            self.conditioning_config.reference_latents_poses_dir: "ref_latents_poses",
-        }
-        if self.with_cross_view_reference:
-            data_sources.update({
-                self.conditioning_config.cross_reference_latents_dir: "cross_ref_latents",
-                self.conditioning_config.cross_reference_latents_poses_dir: "cross_ref_latents_poses",
-            })
-        return data_sources
-
-    def prepare_batch(self, batch: dict[str, dict[str, Tensor]], timestep_sampler: TimestepSampler) -> TrainingBatch:
-        """Prepare batch for IC-LoRA training with reference videos."""
-        # Get pre-encoded latents
-        latents = batch["latents"]
-        target_latents = latents["latents"]
-        ref_latents = batch["ref_latents"]["latents"]
-        ref_latents_pose = batch["ref_latents_pose"]["latents"]
-
-        # Note: Batch sizes > 1 are partially supported, assuming
-        # num_frames, height, width, fps are the same for all batch elements.
-        latent_frames = latents["num_frames"][0].item()
-        latent_height = latents["height"][0].item()
-        latent_width = latents["width"][0].item()
-
-        # Handle FPS with backward compatibility for old preprocessed datasets
-        fps = latents.get("fps", None)
-        if fps is not None and not torch.all(fps == fps[0]):
-            logger.warning(
-                f"Different FPS values found in the batch. Found: {fps.tolist()}, using the first one: {fps[0].item()}"
-            )
-        fps = fps[0].item() if fps is not None else DEFAULT_FPS
-
-        # Get pre-encoded text conditions
-        conditions = batch["conditions"]
-        prompt_embeds = conditions["prompt_embeds"]
-        prompt_attention_mask = conditions["prompt_attention_mask"]
-
-        # Create noise only for the target part
-        sigmas = timestep_sampler.sample_for(target_latents)
-        noise = torch.randn_like(target_latents, device=target_latents.device)
-        sigmas = sigmas.view(-1, 1, 1)
-
-        # Create conditioning mask
-        batch_size = target_latents.shape[0]
-        ref_seq_len = ref_latents.shape[1]
-        target_seq_len = target_latents.shape[1]
-
-        # Reference tokens are always conditioning
-        ref_conditioning_mask = torch.ones(batch_size, ref_seq_len, dtype=torch.bool, device=target_latents.device)
-
-        # Target tokens: check for first frame conditioning
-        target_conditioning_mask = self._create_first_frame_conditioning_mask(
-            batch_size=batch_size,
-            sequence_length=target_seq_len,
-            height=latent_height,
-            width=latent_width,
-            device=target_latents.device,
-        )
-
-        # Combine reference and target conditioning masks
-        conditioning_mask = torch.cat([ref_conditioning_mask, target_conditioning_mask], dim=1)
-
-        # Create timesteps based on conditioning mask
-        sampled_timestep_values = torch.round(sigmas.squeeze(-1).squeeze(-1) * 1000.0).long()
-        timesteps = self._create_timesteps_from_conditioning_mask(conditioning_mask, sampled_timestep_values)
-
-        # Apply noise only to target part
-        noisy_target = (1 - sigmas) * target_latents + sigmas * noise
-
-        # For first frame conditioning in target, use clean latents instead of noisy ones
-        target_conditioning_mask_expanded = target_conditioning_mask.unsqueeze(-1)  # (B, target_seq_len, 1)
-        noisy_target = torch.where(target_conditioning_mask_expanded, target_latents, noisy_target)
-
-        targets = noise - target_latents
-
-        # Concatenate reference and noisy target in the sequence dimension
-        # Shape [batch, sequence_length * 2, channels]  # noqa: ERA001
-        combined_latents = torch.cat([ref_latents, noisy_target], dim=1)
-
-        # Use existing utility function for ROPE scale factors
-        rope_scale_factors = get_rope_scale_factors(fps)
-
-        # Prepare video coordinates (doubled sequence for concatenation)
-        batch_size = combined_latents.shape[0]
-        raw_video_coords = prepare_video_coordinates(
-            num_frames=latent_frames,
-            height=latent_height,
-            width=latent_width,
-            batch_size=batch_size,
-            sequence_multiplier=3,  # IC-LoRA uses tripled sequence (cross-reference + reference + target)
-            device=target_latents.device,
-        )
-
-        # Apply pre-scaling to raw coordinates.
-        # The LTXVideoRotaryPosEmbed expects video_coords to be (B, 3, SeqLen) if provided.
-        # It then divides video_coords[:, 0] by base_num_frames, etc.
-        # So, the video_coords we pass should be: raw_coord * rope_interpolation_factor
-        # (B, 2 * F * H * W)  # noqa: ERA001
-        prescaled_f = raw_video_coords[..., 0] * rope_scale_factors[0]
-        prescaled_h = raw_video_coords[..., 1] * rope_scale_factors[1]
-        prescaled_w = raw_video_coords[..., 2] * rope_scale_factors[2]
-
-        # Stack to (B, 3, 2*F*H*W) for the transformer's video_coords argument
-        video_coords = torch.stack([prescaled_f, prescaled_h, prescaled_w], dim=1)
-
-        return TrainingBatch(
-            latents=combined_latents,
-            targets=targets,
-            prompt_embeds=prompt_embeds,
-            prompt_attention_mask=prompt_attention_mask,
-            timesteps=timesteps,
-            sigmas=sigmas,
-            conditioning_mask=conditioning_mask,
-            num_frames=latent_frames,
-            height=latent_height,
-            width=latent_width,
-            fps=fps,
-            rope_interpolation_scale=rope_scale_factors,
-            video_coords=video_coords,
-        )
-
-    def compute_loss(self, model_pred: Tensor, batch: TrainingBatch) -> Tensor:
-        """Compute masked loss only on target portion, excluding conditioning tokens."""
-        # Extract target portion from model prediction and conditioning mask
-        target_seq_len = batch.targets.shape[1]
-        target_pred = model_pred[:, -target_seq_len:]
-        target_conditioning_mask = batch.conditioning_mask[:, -target_seq_len:]
-
-        loss = (target_pred - batch.targets).pow(2)
-
-        # Create loss mask: exclude conditioning tokens
-        loss_mask = (~target_conditioning_mask.unsqueeze(-1)).float()
-
-        # Apply original loss computation pattern
-        loss = loss.mul(loss_mask).div(loss_mask.mean())
-        return loss.mean()
-
 def get_training_strategy(conditioning_config: ConditioningConfig) -> TrainingStrategy:
     """Factory function to create the appropriate training strategy.
 
@@ -621,15 +469,15 @@ def get_training_strategy(conditioning_config: ConditioningConfig) -> TrainingSt
         strategy = StandardTrainingStrategy(conditioning_config)
     elif conditioning_mode == "reference_video":
         strategy = ReferenceVideoTrainingStrategy(conditioning_config)
-    elif conditioning_mode == "posed_reference_video":
-        # Test if we replace RoPE with PRoPE, the model would collapse
-        assert hasattr(conditioning_config, "reference_latents_pose_dir")
-        strategy = PosedReferenceVideoTrainingStrategy(conditioning_config)
-    elif conditioning_mode == "posed_cross_reference_video":
-        assert hasattr(conditioning_config, "cross_reference_latents_dir")
-        assert hasattr(conditioning_config, "cross_reference_latents_pose_dir")
-        assert hasattr(conditioning_config, "reference_latents_pose_dir")
-        strategy = PosedReferenceVideoTrainingStrategy(conditioning_config)
+    # elif conditioning_mode == "posed_reference_video":
+    #     # Test if we replace RoPE with PRoPE, the model would collapse
+    #     assert hasattr(conditioning_config, "reference_latents_pose_dir")
+    #     strategy = PosedReferenceVideoTrainingStrategy(conditioning_config)
+    # elif conditioning_mode == "posed_cross_reference_video":
+    #     assert hasattr(conditioning_config, "cross_reference_latents_dir")
+    #     assert hasattr(conditioning_config, "cross_reference_latents_pose_dir")
+    #     assert hasattr(conditioning_config, "reference_latents_pose_dir")
+    #     strategy = PosedReferenceVideoTrainingStrategy(conditioning_config)
     else:
         raise ValueError(f"Unknown conditioning mode: {conditioning_mode}")
 

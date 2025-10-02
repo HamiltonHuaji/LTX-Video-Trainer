@@ -25,8 +25,8 @@ from diffusers.image_processor import PipelineImageInput
 from diffusers.loaders import FromSingleFileMixin, LTXVideoLoraLoaderMixin
 from diffusers.models.autoencoders import AutoencoderKLLTXVideo
 
-# from diffusers.models.transformers import LTXVideoTransformer3DModel
-from ltxv_trainer.custom.transformer_ltx import LTXVideoTransformer3DModel
+from diffusers.models.transformers import LTXVideoTransformer3DModel
+# from ltxv_trainer.custom.transformer_ltx import LTXVideoTransformer3DModel
 
 from diffusers.pipelines.ltx.pipeline_output import LTXPipelineOutput
 from diffusers.pipelines.pipeline_utils import DiffusionPipeline
@@ -943,8 +943,8 @@ class LTXConditionPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraL
 
         if isinstance(callback_on_step_end, (PipelineCallback, MultiPipelineCallbacks)):
             callback_on_step_end_tensor_inputs = callback_on_step_end.tensor_inputs
-        if latents is not None:
-            raise ValueError("Passing latents is not yet supported.")
+        # if latents is not None:
+        #     raise ValueError("Passing latents is not yet supported.")
 
         # 1. Check inputs. Raise error if not correct
         self.check_inputs(
@@ -1021,6 +1021,7 @@ class LTXConditionPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraL
             negative_prompt_attention_mask=negative_prompt_attention_mask,
             max_sequence_length=max_sequence_length,
             device=device,
+            dtype=self.transformer.dtype
         )
         if self.do_classifier_free_guidance:
             prompt_embeds = torch.cat([negative_prompt_embeds, prompt_embeds], dim=0)
@@ -1060,7 +1061,7 @@ class LTXConditionPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraL
 
         # 4. Prepare latent variables
         num_channels_latents = self.transformer.config.in_channels
-        latents, conditioning_mask, video_coords, extra_conditioning_num_latents = self.prepare_latents(
+        latents_, conditioning_mask, video_coords, extra_conditioning_num_latents = self.prepare_latents(
             conditioning_tensors,
             strength,
             frame_index,
@@ -1073,6 +1074,10 @@ class LTXConditionPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraL
             device=device,
             dtype=torch.float32,
         )
+        if latents is None:
+            latents = latents_
+        # print(f"{latents.std(dim=1)}")
+        # print(f"{video_coords=}")
 
         # 4.5. Process reference video (if provided) and concatenate at the beginning
         reference_latents = None
@@ -1184,6 +1189,7 @@ class LTXConditionPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraL
                 )
                 conditioning_mask = torch.cat([conditioning_mask, target_conditioning_mask], dim=1)
 
+        # print(f"{video_coords=}")
         video_coords = video_coords.float()
         if reference_video is None:
             video_coords[:, 0] = video_coords[:, 0] * (1.0 / frame_rate)
@@ -1203,10 +1209,12 @@ class LTXConditionPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraL
             self.scheduler,
             num_inference_steps,
             device,
-            timesteps=timesteps,
+            timesteps=timesteps.cpu(),
         )
         num_warmup_steps = max(len(timesteps) - num_inference_steps * self.scheduler.order, 0)
         self._num_timesteps = len(timesteps)
+
+        # print(f"{timesteps=}")
 
         # 6. Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
@@ -1227,6 +1235,7 @@ class LTXConditionPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraL
                         conditioning_mask,
                         generator,
                     )
+                # print(f"{latents.std(dim=1)}")
 
                 latent_model_input = torch.cat([latents] * 2) if self.do_classifier_free_guidance else latents
                 if is_conditioning_image_or_video or reference_video is not None:
@@ -1242,6 +1251,12 @@ class LTXConditionPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraL
                 if is_conditioning_image_or_video or reference_video is not None:
                     timestep = torch.min(timestep, (1 - conditioning_mask_model_input) * 1000.0)
 
+                # from gshub.utils import describe
+                # print(f"{latent_model_input.std(dim=1)=}")
+                # print(f"{describe(prompt_embeds)=}")
+                # print(f"{prompt_embeds=}")
+                # print(f"{timestep=}")
+                # print(f"{video_coords.std(dim=1)=}")
                 noise_pred = self.transformer(
                     hidden_states=latent_model_input,
                     encoder_hidden_states=prompt_embeds,
@@ -1256,15 +1271,25 @@ class LTXConditionPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraL
                     noise_pred_uncond, noise_pred_text = noise_pred.chunk(2)
                     noise_pred = noise_pred_uncond + self.guidance_scale * (noise_pred_text - noise_pred_uncond)
                     timestep, _ = timestep.chunk(2)
+                # print(f"{noise_pred=}")
+                # print(f"{timestep=}")
 
+                # from gshub.utils import describe
+                # print(f"{describe(noise_pred)=}")
+                # print(f"{describe(t)=}")
+                # print(f"{describe(latents)=}")
+                # print(f"{describe(timestep)=}")
                 denoised_latents = self.scheduler.step(
                     -noise_pred, t, latents, per_token_timesteps=timestep, return_dict=False
                 )[0]
+                # print(f"{denoised_latents=}")
                 if is_conditioning_image_or_video or reference_video is not None:
                     tokens_to_denoise_mask = (t / 1000 - 1e-6 < (1.0 - conditioning_mask)).unsqueeze(-1)
                     latents = torch.where(tokens_to_denoise_mask, denoised_latents, latents)
                 else:
                     latents = denoised_latents
+                # print(f"{latents.std(dim=1)}")
+                # break
 
                 if callback_on_step_end is not None:
                     callback_kwargs = {}
@@ -1281,6 +1306,8 @@ class LTXConditionPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLoraL
 
                 if XLA_AVAILABLE:
                     xm.mark_step()
+
+            # print(f"{latents.std(dim=1)}")
 
         # Handle reference video output processing
         if reference_video is not None and output_reference_comparison:

@@ -2,7 +2,7 @@ import json
 import tempfile
 from enum import Enum
 from pathlib import Path
-from typing import Union
+from typing import Union, TypeVar
 from urllib.parse import urlparse
 
 import torch
@@ -10,9 +10,9 @@ from diffusers import (
     AutoencoderKLLTXVideo,
     BitsAndBytesConfig,
     FlowMatchEulerDiscreteScheduler,
-    # LTXVideoTransformer3DModel,
+    LTXVideoTransformer3DModel,
 )
-from ltxv_trainer.custom.transformer_ltx import LTXVideoTransformer3DModel
+# from ltxv_trainer.custom.transformer_ltx import LTXVideoTransformer3DModel
 
 from pydantic import BaseModel, ConfigDict
 from transformers import T5EncoderModel, T5Tokenizer
@@ -214,12 +214,14 @@ def load_vae(
 
     raise ValueError(f"Invalid model source: {source}")
 
+T = TypeVar('T', bound=LTXVideoTransformer3DModel)
 
 def load_transformer(
     source: ModelSource,
     *,
     dtype: torch.dtype = torch.float32,
-) -> LTXVideoTransformer3DModel:
+    transformer_cls: type[T] = LTXVideoTransformer3DModel
+) -> T:
     """
     Load the transformer component.
 
@@ -241,32 +243,26 @@ def load_transformer(
             LtxvModelVersion.LTXV_13B_097_DEV,
             LtxvModelVersion.LTXV_13B_097_DISTILLED,
         ):
-            return _load_ltxv_13b_transformer(source.safetensors_url, dtype=dtype)
+            return _load_ltxv_13b_transformer(source.safetensors_url, dtype=dtype, transformer_cls=transformer_cls)
 
-        return LTXVideoTransformer3DModel.from_single_file(
+        return transformer_cls.from_single_file(
             source.safetensors_url,
             torch_dtype=dtype,
+            low_cpu_mem_usage=False,
         )
     elif isinstance(source, (str, Path)):
         if _is_safetensors_url(source):
             try:
-                return LTXVideoTransformer3DModel.from_single_file(
-                    source,
-                    torch_dtype=dtype,
-                )
+                return transformer_cls.from_single_file(str(source), torch_dtype=dtype, low_cpu_mem_usage=False,)
             except ValueError as e:
                 if "Cannot load  because time_embed.emb.timestep_embedder.linear_1.bias" in str(e):
                     # This is a special case for newer LTXV 13B transformers which must be loaded with a custom config.
                     # Remove this once Diffusers properly supports the new model.
-                    return _load_ltxv_13b_transformer(source, dtype=dtype)
+                    return _load_ltxv_13b_transformer(str(source), dtype=dtype, transformer_cls=transformer_cls)
                 else:
                     raise e
         elif _is_huggingface_repo(source):
-            return LTXVideoTransformer3DModel.from_pretrained(
-                source,
-                subfolder="transformer",
-                torch_dtype=dtype,
-            )
+            return transformer_cls.from_pretrained(source, subfolder="transformer", torch_dtype=dtype)
 
     raise ValueError(f"Invalid model source: {source}")
 
@@ -345,7 +341,7 @@ def _is_safetensors_url(source: str | Path) -> bool:
     return source.endswith(".safetensors")
 
 
-def _load_ltxv_13b_transformer(safetensors_url: str, *, dtype: torch.dtype) -> LTXVideoTransformer3DModel:
+def _load_ltxv_13b_transformer(safetensors_url: str, *, dtype: torch.dtype, transformer_cls: type[T] = LTXVideoTransformer3DModel) -> T:
     """A specific loader for LTXV-13B's transformer which doesn't yet have a Diffusers config"""
     transformer_13b_config = {
         "_class_name": "LTXVideoTransformer3DModel",
@@ -370,8 +366,8 @@ def _load_ltxv_13b_transformer(safetensors_url: str, *, dtype: torch.dtype) -> L
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json") as f:
         json.dump(transformer_13b_config, f)
         f.flush()
-        return LTXVideoTransformer3DModel.from_single_file(
+        return transformer_cls.from_single_file(
             safetensors_url,
             config=f.name,
             torch_dtype=dtype,
-        )
+        ) # type: ignore
